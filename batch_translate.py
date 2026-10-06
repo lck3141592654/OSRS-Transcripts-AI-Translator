@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from glossary import load_glossary
 from tm_matcher import match_and_fill
 from llm_translator import prepare_sheet_translation, translate_sheet_phase, is_missing_translation
-from llm_translator import save_session, delete_checkpoint_files, load_backup
+from llm_translator import save_session, delete_checkpoint_files, load_backup, get_debug_message_dir
 from enforcer import enforce_async
 from shared_pool import SharedBatchPool
 
@@ -323,6 +323,10 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
 
     if all_review_rows:
         combined_review = pd.concat(all_review_rows, ignore_index=True)
+        # 與其他三份報告同口徑去重（證明用報告則共用 proofreader 的實作，避免第二份實作）
+        from proofreader import _dedup_report_rows
+        combined_review = _dedup_report_rows(
+            combined_review, ["sheet_name", "english", "issue"], "review_report")
         report_path = workplace / "review_report.xlsx"
         combined_review.to_excel(report_path, index=False, sheet_name='Sheet1')
 
@@ -446,7 +450,7 @@ async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_pa
         for sheet_name, res in zip(sheet_states, results):
             if isinstance(res, BaseException):
                 if isinstance(res, RuntimeError) and "all APIs permanently disabled" in str(res):
-                    print("\n  ⚠️所有 API 已永久停用（兩次 429 限流），無法繼續")
+                    print("\n  ⚠️所有 API 已永久停用（累計 429 限流達門檻；只有一個可用 API 時門檻會放寬），無法繼續")
                     print("  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳")
                 raise res
             df, review_df = res
@@ -476,7 +480,7 @@ async def main():
     print(SEP)
 
     # ── 檢查上次的 debug 訊息 ──
-    debug_dir = _get_workplace() / "_debugmessage"
+    debug_dir = get_debug_message_dir(create=False)
     if debug_dir.exists():
         debug_files = sorted(debug_dir.glob("debug_*.json"))
         if debug_files:
@@ -550,12 +554,25 @@ async def main():
                 backup = load_backup(str(workplace), sn)
                 if backup:
                     restore_count = 0
+                    bad_entries = 0
                     for idx_str, trans in backup.items():
-                        idx = int(idx_str)
+                        # 檢查點檔損壞或人為編輯時 key 可能不是數字、值可能不是字串；
+                        # 單筆壞資料不可讓整張工作表的還原失敗
+                        # （與 llm_translator.prepare_sheet_translation 同口徑）
+                        try:
+                            idx = int(idx_str)
+                        except (TypeError, ValueError):
+                            bad_entries += 1
+                            continue
+                        if not isinstance(trans, str) or not trans.strip():
+                            bad_entries += 1
+                            continue
                         if idx in df_full.index:
                             df_full.at[idx, "translation"] = trans
                             restore_count += 1
                     print(f"    還原 {restore_count} 條翻譯")
+                    if bad_entries:
+                        print(f"    警告：檢查點有 {bad_entries} 筆無效資料（非數字 key 或非字串譯文），已略過")
                 all_translated_dfs[sn] = df_full
 
             # ── 還原累積審查資料 ──
@@ -656,7 +673,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
-            print("\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續。")
+            print("\n  ⚠️ 所有 API 已永久停用（累計 429 限流達門檻；只有一個可用 API 時門檻會放寬），無法繼續。")
             print("  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳。")
             input("\n按 Enter 關閉...")
         else:

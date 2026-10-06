@@ -1,14 +1,21 @@
 import pandas as pd
 from pathlib import Path
+from collections import Counter
 import json, asyncio, time, re
 from dotenv import load_dotenv
 from datetime import datetime
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from glossary import ADD_LIST, find_term_spans, build_relevance_context
-from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary, is_missing_translation
-from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
+from glossary import ADD_LIST, find_term_spans, build_relevance_context, filter_relevant_terms, MISSING_SENTINELS
+from llm_translator import (
+    BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary,
+    is_missing_translation, _english_hint, _english_hint_at,
+)
+from api_config import (
+    API_TIMEOUT, OVER_RETURN_TOLERANCE,
+    is_rate_limit_error, is_rate_limit_payload, RateLimitPayloadError,
+)
 from shared_pool import SharedBatchPool
 
 RETRY_PROMPTS = [
@@ -22,14 +29,16 @@ RETRY_PROMPTS = [
     "如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
 ]
 
-def _find_matched_spans(eng_lower: str, glossary: dict) -> list:
+def _find_matched_spans(eng_lower: str, glossary: dict, ctx=None) -> list:
     """對每條原文找出所有匹配到（詞邊界）的術語及其 span，按術語長度降序排列。
 
     回傳 list[(eng, chn, [(start, end), ...])]
+    ctx：由呼叫端預先建立的匹配上下文（build_relevance_context），
+    一行文本只建立一次、所有術語共用，避免每術語重掃文本（大表掃描 10x 加速）。
     """
     matches = []
     for eng, chn in glossary.items():
-        spans = find_term_spans(eng, eng_lower)
+        spans = find_term_spans(eng, eng_lower, ctx)
         if spans:
             matches.append((eng, chn, spans))
     # 長術語優先處理（避免短術語被長術語覆蓋時誤報）
@@ -45,17 +54,18 @@ def build_retry_glossary_text(glossary: dict, batch: list) -> str:
     return "\n".join([f"  {e} → {c}" for e, c in relevant])
 
 
-def check_glossary_usage(english_text: str, translated_text: str, glossary: dict) -> list:
+def check_glossary_usage(english_text: str, translated_text: str, glossary: dict, ctx=None) -> list:
     """詞邊界匹配，防止『V』匹配到『Convert』或『Don』匹配到『don't』這類誤報。
 
     當原文中長術語（如 "Lord Hosidius"）的翻譯已正確出現在譯文中，
     則其範圍內的短術語（如 "Hosidius"）不再重複檢查。
+    ctx：可選的預建匹配上下文（build_relevance_context），由 scan_issues 每行建立一次。
     """
     issues = []
     eng_lower = english_text.lower()
     trans_lower = translated_text.lower()
 
-    matches = _find_matched_spans(eng_lower, glossary)
+    matches = _find_matched_spans(eng_lower, glossary, ctx)
 
     covered_by_correct = []  # 已被正確翻譯的長術語所覆蓋的 span 集合
     for eng, chn, spans in matches:
@@ -76,12 +86,25 @@ def check_glossary_usage(english_text: str, translated_text: str, glossary: dict
     return issues
 
 def check_placeholder(english_text: str, translated_text: str) -> list[str]:
-    """比對原文和譯文中的 [...] 是否一致，返回問題描述清單"""
+    """比對原文和譯文中的 [...] 是否一致，返回問題描述清單
+
+    除了「原文的每個佔位符是否出現」，也比對兩邊的數量與譯文多出的佔位符：
+    原文 [a] [a] 而譯文只剩一個 [a]、或譯文自行多出 [name]，原本都不會被發現。
+    """
     issues = []
-    eng_placeholders = re.findall(r'\[.*?\]', english_text)
-    for ph in eng_placeholders:
-        if ph not in translated_text:
+    eng_cnt = Counter(re.findall(r'\[.*?\]', english_text))
+    trans_cnt = Counter(re.findall(r'\[.*?\]', translated_text))
+    if eng_cnt == trans_cnt:
+        return issues
+    for ph, n in eng_cnt.items():
+        got = trans_cnt.get(ph, 0)
+        if got == 0:
             issues.append(f"佔位符「{ph}」被翻譯或遺失")
+        elif got != n:
+            issues.append(f"佔位符「{ph}」數量不符（原文 {n} 個，譯文 {got} 個）")
+    for ph in trans_cnt:
+        if ph not in eng_cnt:
+            issues.append(f"譯文多出佔位符「{ph}」")
     return issues
 
 
@@ -90,22 +113,29 @@ def check_untranslated(english_text: str, translated_text, keep_original_terms: 
 
     keep_original_terms：術語庫（ADD_LIST 等）明確要求保持原文的術語集合，
     這些條目譯文與原文相同是「正確行為」，不視為未翻譯。
+    集合內一律存小寫（見 scan_issues 的建構式），比對時也把小寫化，
+    否則工作表原文的大小寫與 ADD_LIST 的 key 不同時仍會被判為未翻譯。
     """
     issues = []
     keep_original_terms = keep_original_terms or set()
     eng_str = str(english_text).strip()
     # 情況 A：translation 為空（含字串 nan/nat/none，但原文本身是這些字時除外）
-    if is_missing_translation(translated_text, english=eng_str):
+    # 原文提示值一律走 _english_hint：english_text 可能是 float NaN（英文欄空白），
+    # 先 str() 會變成字串 "nan" 而被當成「原文真的是 nan」錯誤豁免（P1 與 P4 分歧）
+    if is_missing_translation(translated_text, english=_english_hint(english_text)):
         issues.append("translation 欄位為空")
         return issues
     trans_str = str(translated_text).strip()
     # 情況 B：譯文與原文相同（不分大小寫）
     if trans_str.lower() == eng_str.lower():
         # 原文本身是 nan/nat/none 這類字時，相同譯文是合法結果
-        if eng_str.lower() in ("nan", "nat", "none"):
+        # （哨兵集合與 is_missing_translation 共用同一份 glossary.MISSING_SENTINELS，
+        #  避免這裡只擋 "nan" 而放行 "nat"/"none"）
+        if eng_str.lower() in MISSING_SENTINELS:
             return issues
         # ADD_LIST 明確要求保持原文的術語：直接視為正確
-        if eng_str in keep_original_terms:
+        # 集合存小寫、比對也小寫，大小寫不同（OSRS / osrs / Osrs）時才不會誤判
+        if eng_str.strip().lower() in keep_original_terms:
             return issues
         if re.search(r"[a-zA-Z]", eng_str):
             # 排除純佔位符條目：去除 [] 後只留下空白或標點符號時不視為未翻譯
@@ -120,9 +150,13 @@ def check_space_issues(translated_text: str) -> list:
 
     英文半形標點的左右空格是正常英文格式，不列入問題；
     只有英文括號（半形 ()）旁的空格屬於括號排版問題。
+
+    缺值判定改用 `is_missing_translation`（與其他站點同口徑）：None／NaN／NaT／
+    pd.NA／空字串與純空白都沒有「空格問題」可報，一律提前回傳；
+    舊寫法只認 float NaN，pd.NA／NaT 會被 `str()` 成 "<NA>"/"NaT" 後繼續檢查。
     """
     issues = []
-    if translated_text is None or (isinstance(translated_text, float) and pd.isna(translated_text)):
+    if is_missing_translation(translated_text):
         return issues
     trans_str = str(translated_text)
     if "  " in trans_str:
@@ -161,7 +195,7 @@ def fix_space_issues(text: str) -> str:
     英文括號（半形 ()）旁的空白屬於括號排版問題，會修正為緊貼括號。
     """
     text = re.sub(r" {2,}", " ", text)
-    text = re.sub(r"([\u4e00-\u9fff]) ([\u4e00-\u9fff])", r"\1\2", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff]) (?=[\u4e00-\u9fff])", "", text)
     text = re.sub(r" ([\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001])", r"\1", text)
     text = re.sub(r"([\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]) ", r"\1", text)
     # 英文括號（半形 ()）：
@@ -177,9 +211,15 @@ def fix_space_issues(text: str) -> str:
 def preprocess_issues(df, pool):
     """對問題條目進行腳本預處理（單佔位符修正 + 空格修正），直接修改 df"""
     for idx, row, issues in pool:
+        # 未翻譯的列交給 LLM 重譯；若在此先改寫譯文，「譯文＝原文」的判定會失效，
+        # 該列會從問題池消失、既不重譯也不進報告
+        if any(t == "untranslated" for t, _, _ in issues):
+            continue
         eng = str(row.get("english", ""))
         trans = row.get("translation")
-        if trans is None or (isinstance(trans, float) and pd.isna(trans)):
+        # 缺值（含 pd.NA／NaT／空字串／哨兵字串）沒有可修正的譯文可改；
+        # english= 讓原文本身真的是 "nan"/"nat"/"none" 時不誤判
+        if is_missing_translation(trans, english=_english_hint(row.get("english"))):
             continue
         new_trans = str(trans)
         new_trans = fix_single_placeholder(eng, new_trans)
@@ -187,16 +227,45 @@ def preprocess_issues(df, pool):
         if new_trans != str(trans):
             df.at[idx, "translation"] = new_trans
     return df
+def narrow_relevant_glossary(df, glossary) -> dict:
+    """把 filter_relevant_terms 的安全上界收斂成「真的會在某列命中」的術語集合。
+
+    上界的好處是快（O(術語數)，不做逐術語全文掃描），代價是詞庫偏大，
+    而逐列精確比對的成本與詞庫大小成正比；一次 enforce 會跑許多次
+    scan_issues（每輪前後各一次，最多三輪，外加最終掃描），所以先用一次
+    逐列掃描把沒命中的術語去掉，之後每一輪都回到精確成本。
+
+    為什麼收斂不會漏：英文原文在整個 enforce 期間不會改變，因此「哪些術語
+    會命中某一列」是固定的；這裡只依英文原文判斷（不看譯文），所以尚未翻譯
+    的列也一併納入，後續輪次才被翻譯的列不會失去它的術語。
+    """
+    matched: set = set()
+    for _idx, row in df.iterrows():
+        eng = str(row.get("english", ""))
+        if not eng:
+            continue
+        eng_lower = eng.lower()
+        ctx = build_relevance_context(eng_lower)
+        for e, _chn, _spans in _find_matched_spans(eng_lower, glossary, ctx):
+            matched.add(e)
+    if not matched:
+        return {}
+    # 保留 glossary 的原始順序（下游 get_relevant_glossary 依賴相對順序穩定）
+    return {e: c for e, c in glossary.items() if e in matched}
+
+
 def scan_issues(df, relevant_glossary) -> list[tuple]:
     """走訪所有行，彙整三種檢查的結果，回傳問題 pool"""
-    keep_original_terms = {k for k, v in ADD_LIST.items() if v.strip().lower() == str(k).strip().lower()}
+    keep_original_terms = {k.strip().lower() for k, v in ADD_LIST.items() if v.strip().lower() == str(k).strip().lower()}
     pool = []
     for idx, row in df.iterrows():
-        eng = str(row.get("english", ""))
+        eng = row.get("english")
         trans = row.get("translation")
         all_issues = []
 
         # 未翻譯檢查（包含空值情況）
+        # 傳原值而非 str(...)：英文欄空白時 str() 會變字串 "nan"，
+        # 讓 check_untranslated 的原文豁免錯誤放行哨兵譯文（見 _english_hint_at 說明）
         untrans_issues = check_untranslated(eng, trans, keep_original_terms=keep_original_terms)
         if untrans_issues:
             for ui in untrans_issues:
@@ -207,9 +276,13 @@ def scan_issues(df, relevant_glossary) -> list[tuple]:
         # 術語檢查（已有譯文才做）
         eng_term = str(eng)
         trans_str = str(trans)
-        glossary_issues = check_glossary_usage(eng_term, trans_str, relevant_glossary)
-        for eng_term, chn, desc in glossary_issues:
-            all_issues.append(("glossary", f"{eng_term} → {chn}", desc))
+        # 每行只建立一次匹配上下文，供該行所有術語共用（避免每術語重建，大表掃描 10x 加速）
+        ctx = build_relevance_context(eng_term.lower())
+        glossary_issues = check_glossary_usage(eng_term, trans_str, relevant_glossary, ctx)
+        # 注意迴圈變數不可命名為 eng_term：那會覆蓋上面的英文原文，
+        # 使下一段的 check_placeholder() 拿到術語字串而非原文，該行佔位符問題被靜默吞掉
+        for g_eng, g_chn, g_desc in glossary_issues:
+            all_issues.append(("glossary", f"{g_eng} → {g_chn}", g_desc))
 
         # 佔位符檢查
         ph_issues = check_placeholder(eng_term, trans_str)
@@ -302,6 +375,10 @@ async def _retry_round(client, model_name, pool, glossary, rnd):
                 content = re.sub(r"^```(?:json)?\n?", "", content, flags=re.IGNORECASE)
                 content = re.sub(r"\n```$", "", content)
                 parsed = json.loads(content)
+                # 有些供應商 HTTP 200 但 body 是限流錯誤物件 → 當成 429 往上拋
+                if is_rate_limit_payload(parsed):
+                    raise RateLimitPayloadError(
+                        f"429 rate limit in response payload: {content[:200]}")
                 results = _extract_retry_results(parsed, batch)
                 if not results:
                     raise ValueError("回傳為空、結構無法識別或無匹配的 index，視為失敗重試")
@@ -315,11 +392,17 @@ async def _retry_round(client, model_name, pool, glossary, rnd):
                     repaired = repair_json(content)
                     if repaired:
                         fixed = json.loads(repaired)
+                        if is_rate_limit_payload(fixed):
+                            raise RateLimitPayloadError(
+                                f"429 rate limit in response payload: {str(fixed)[:200]}")
                         results = _extract_retry_results(fixed, batch)
                         if results:
                             all_results.extend(results)
                             print(f"    ⚠️ JSON 修復成功")
                             break
+                except RateLimitPayloadError:
+                    # 修復後的內容仍是限流錯誤包裝 → 不可被吞掉，要往上拋成 429
+                    raise
                 except Exception:
                     pass
                 # ↑ 修復結束
@@ -328,8 +411,7 @@ async def _retry_round(client, model_name, pool, glossary, rnd):
                 if attempt < 2:
                     await asyncio.sleep(2)
             except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "rate" in error_str:
+                if is_rate_limit_error(e):
                     raise
                 print(f"    API 錯誤 (嘗試 {attempt + 1}/3): {e}")
                 if attempt < 2:
@@ -453,20 +535,30 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
                         continue
                     idx = res.get("index")
                     trans = res.get("translation")
-                    if idx is not None and trans is not None:
+                    # 只有非空字串可以寫進 translation 欄。實測 dict/list 會讓 pandas
+                    # 拋「Incompatible indexer with Series」，被批次層 except 吞掉後
+                    # 整個批次（含合法條目）一起失敗、完全沒有修正；空字串則會把
+                    # 既有譯文清成空白。缺值哨兵（"nan"/"nat"/"none"）同樣不是譯文，
+                    # 寫進去會與三條還原守門不一致。這裡逐筆擋掉，其餘合法條目照常寫入。
+                    if (idx is None or not isinstance(trans, str) or not trans.strip()
+                            or is_missing_translation(trans, english=_english_hint_at(df, idx))):
+                        skipped += 1
+                        continue
+                    try:
                         if idx in batch_indices:
                             df.at[idx, "translation"] = trans
                             fixed += 1
                         else:
                             skipped += 1
+                    except (TypeError, ValueError, KeyError, IndexError):
+                        skipped += 1
                 if skipped:
-                    print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件或 index 不在工作表中），已忽略")
+                    print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件、index 不在工作表中，或譯文非字串），已忽略")
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"  [{now}] [重譯] 批次 {job.batch_num}/{total_batches} 完成 ({fixed} 条已修正) [{cfg.api_id} {cfg.model}]")
             except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "rate" in error_str:
-                    cfg.mark_429()
+                if is_rate_limit_error(e):
+                    shared_pool.note_429(cfg)
                     if cfg.is_permanently_disabled:
                         print(f"  [{cfg.api_id} {cfg.model}] 第 {cfg.strike} 次 429，永久停用")
                     else:
@@ -486,7 +578,11 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
             backup_data = {}
             for idx, row, _ in pool:
                 trans = df.at[idx, "translation"]
-                if trans is not None:
+                # NaN 不是 None：只判 is not None 會把空譯文存成字串 "nan"，
+                # 續傳時再寫回成品。
+                # english= 必須用 _english_hint：直接 str() 會把缺值的英文欄
+                # 變成字串 "nan"／"None"，讓字面譯文 "nan" 被誤判成合法譯文
+                if not is_missing_translation(trans, english=_english_hint(row.get("english"))):
                     backup_data[str(idx)] = str(trans)
             if backup_data:
                 save_backup_part(output_dir, enforce_tag, rnd + 1, backup_data, sheet_name)
@@ -531,12 +627,15 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
     review_rows = []
 
     # 只保留對當前批次有相關性的術語
+    # 用安全上界過濾（詞集合／子字串），不做逐術語全文掃描：
+    # 原本對整張工作表的 all_text（實際最大 7 MB）逐條跑 find_term_spans，
+    # 每條都要掃全文，整張表是小時級成本（見 filter_relevant_terms 的說明）。
     all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
     _ctx = build_relevance_context(all_text)
-    relevant_glossary = {
-        e: c for e, c in glossary.items()
-        if find_term_spans(e, all_text, _ctx)
-    }
+    relevant_glossary = filter_relevant_terms(glossary, all_text, _ctx)
+    # 上界只是「不會漏」；用一次逐列掃描收斂成真正命中的集合，
+    # 讓後續每一次 scan_issues 都回到精確成本
+    relevant_glossary = narrow_relevant_glossary(df, relevant_glossary)
 
     # 非同步重譯（使用共享池；未提供時建立臨時池）
     if shared_pool is not None:
@@ -557,7 +656,9 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
     final_pool = scan_issues(df, relevant_glossary)
     for idx, row, issues in final_pool:
         trans = row.get("translation")
-        trans_str = str(trans) if not (trans is None or (isinstance(trans, float) and pd.isna(trans))) else ""
+        # 審查報告的「目前譯文」不可出現 "<NA>"／"nan" 這類缺值字面值
+        trans_str = "" if is_missing_translation(
+            trans, english=_english_hint(row.get("english"))) else str(trans)
         for issue_type, suggested_fix, desc in issues:
             review_rows.append({
                 "english": str(row.get("english", "")),

@@ -9,17 +9,21 @@ from copy import deepcopy
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
-from glossary import load_glossary, auto_extract_glossary, find_term_spans, build_relevance_context
+from glossary import load_glossary, auto_extract_glossary, find_term_spans, build_relevance_context, filter_relevant_terms
 from tm_matcher import match_and_fill
 from llm_translator import (
     _group_into_batches, _sanitize_sheet_name,
     save_backup_part, sync_progress, atomic_write_text,
-    get_relevant_glossary,
+    get_relevant_glossary, is_missing_translation, get_debug_message_dir,
+    _english_hint, _english_hint_at,
 )
 from enforcer import (
-    scan_issues, _enforce_async,
+    scan_issues, _enforce_async, narrow_relevant_glossary,
 )
-from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
+from api_config import (
+    API_TIMEOUT, OVER_RETURN_TOLERANCE,
+    is_rate_limit_error, is_rate_limit_payload, RateLimitPayloadError,
+)
 from shared_pool import SharedBatchPool
 
 # Constants
@@ -114,10 +118,35 @@ SYSTEM_PROMPT_EVAL = (
     "{RELEVANT_GLOSSARY}"
 )
 
+def _normalize_level(value) -> str:
+    """評估等級正規化：型別錯誤／空值一律視為「严重」。
+
+    `dict.get(key, default)` 只在 key 不存在時用預設值；key 存在但值是 None／
+    空字串／非字串時會拿到壞值，流進 `_cross_reference`（unhashable 直接拋錯、
+    或與 skip_pairs 比對後被漏報）、報告與檢查點。此處與 `_pad_eval_results`
+    的補位語意一致，一律以「严重」處理，避免漏報。
+    """
+    if isinstance(value, str) and value.strip():
+        return value
+    return "严重"
+
+
+def _normalize_eval_entry(entry, index=None):
+    """把模型／檢查點回傳的評估物件正規化成 {"index","level","reason"}。"""
+    if not isinstance(entry, dict):
+        return None
+    idx = entry.get("index", index)
+    return {"index": idx, "level": _normalize_level(entry.get("level")),
+            "reason": entry.get("reason", "")}
+
+
 def _cross_reference(round1, round2):
     # 跳過組合僅限 (沒問題,沒問題)、(沒問題,輕度)、(輕度,沒問題)；兩輪皆「輕度」仍送潤色
     skip_pairs = {("没问题", "没问题"), ("轻度", "没问题"), ("没问题", "轻度")}
-    return (round1.get("level"), round2.get("level")) not in skip_pairs
+    # 防禦：即使呼叫端沒先正規化，非 dict／非字串 level 也不可讓 (unhashable) 比較拋錯
+    lv1 = _normalize_level(round1.get("level") if isinstance(round1, dict) else None)
+    lv2 = _normalize_level(round2.get("level") if isinstance(round2, dict) else None)
+    return (lv1, lv2) not in skip_pairs
 
 
 def _pad_eval_results(results, batch):
@@ -158,6 +187,9 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\n```$", "", text)
             results = json.loads(text)
+            # 有些供應商 HTTP 200 但 body 是限流錯誤物件 → 當成 429 往上拋
+            if is_rate_limit_payload(results):
+                raise RateLimitPayloadError(f"429 rate limit in response payload: {text[:200]}")
 
             # 方法一：先试明确的 key 名称
             if isinstance(results, dict):
@@ -243,6 +275,9 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                 repaired = repair_json(text)
                 if repaired:
                     results = json.loads(repaired)
+                    if is_rate_limit_payload(results):
+                        raise RateLimitPayloadError(
+                            f"429 rate limit in response payload: {str(results)[:200]}")
                     print(f"    [{api_id}] ⚠️ JSON 修復成功")
                     if isinstance(results, dict):
                         if "evaluations" in results:
@@ -274,6 +309,9 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                             print(f"    回傳內容前 200 字: {text[:200]}")
                         results = _pad_eval_results(results, batch)
                         return results
+            except RateLimitPayloadError:
+                # 修復後的內容仍是限流錯誤包裝 → 不可被吞掉，要往上拋成 429
+                raise
             except Exception:
                 pass
         except ValueError as e:
@@ -281,7 +319,7 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
             if attempt < 2:
                 await asyncio.sleep(3)
         except Exception as e:
-            if "429" in str(e).lower() or "rate" in str(e).lower():
+            if is_rate_limit_error(e):
                 raise
             print(f"    [{api_id}] API 錯誤 (嘗試 {attempt + 1}/3): {e}")
             if attempt < 2:
@@ -309,13 +347,37 @@ def _load_phase2_category(output_dir, sheet_name, df):
         r2 = json.loads(f2.read_text(encoding="utf-8"))
     except Exception:
         return []
+    if not isinstance(r1, dict) or not isinstance(r2, dict):
+        print("    警告：P2 檢查點結構異常（非物件），略過還原")
+        return []
+    default_r2 = {"level": "严重", "reason": "评估缺失，预设为严重"}
     result = []
+    skipped = 0
     for idx_str, r1r in r1.items():
-        idx = int(idx_str)
-        r2r = r2.get(idx_str, {"level": "严重", "reason": "评估缺失，预设为严重"})
+        # 檢查點損壞或人為編輯：單筆壞資料只跳過該筆，不可讓整個工作表還原失敗
+        try:
+            idx = int(idx_str)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if not isinstance(r1r, dict):
+            skipped += 1
+            continue
+        r2r = r2.get(idx_str, default_r2)
+        if not isinstance(r2r, dict):
+            r2r = default_r2
+        r1r = _normalize_eval_entry(r1r, idx)
+        r2r = _normalize_eval_entry(r2r, idx)
+        # index 一律以 key 為準（與原行為一致），避免鍵值不一致的檢查點產生錯位
+        r1r["index"] = idx
+        r2r["index"] = idx
         if _cross_reference(r1r, r2r):
             if idx in df.index:
-                row = df.loc[idx]
+                try:
+                    row = df.loc[idx]
+                except Exception:
+                    skipped += 1
+                    continue
                 result.append({
                     "index": idx,
                     "english": str(row.get("english", "")),
@@ -323,6 +385,8 @@ def _load_phase2_category(output_dir, sheet_name, df):
                     "round1": r1r,
                     "round2": r2r,
                 })
+    if skipped:
+        print(f"    警告：P2 檢查點有 {skipped} 筆無效資料（非數字 key 或非物件），已略過")
     return result
 
 
@@ -408,11 +472,11 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
     pending = []
     for idx, row in df.iterrows():
         trans = row.get("translation")
-        if trans is None or (isinstance(trans, float) and pd.isna(trans)):
+        # 與 P1／P4 同口徑：None／NaN／NaT／pd.NA／空字串／哨兵字串都不是可用譯文，
+        # 原文本身真的是 "nan"/"nat"/"none" 時（english= 提示）才算合法譯文
+        if is_missing_translation(trans, english=_english_hint(row.get("english"))):
             continue
         ts = str(trans).strip()
-        if not ts or ts.lower() in ("nan", "nat", "none"):
-            continue
         pending.append({
             "_idx": idx,
             "english": str(row.get("english", "")),
@@ -438,17 +502,24 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
         try:
             results = await _evaluate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
             results = results[:len(batch)]
-            success_count = sum(1 for r in results if isinstance(r, dict) and r.get("level") and r.get("reason"))
+            # 正規化後的等級一律是非空字串（壞值→「严重」），計數與 skip_pairs 才一致
+            normalized = []
+            for res in results:
+                if not isinstance(res, dict):
+                    continue
+                idx = res.get("index")
+                if idx is None:
+                    continue
+                normalized.append(_normalize_eval_entry(res, idx))
+            results = normalized
+            success_count = sum(1 for r in results if r.get("level") and r.get("reason"))
             rr = rr1 if rnd == 1 else rr2
+            part_data = {}
             for res in results:
                 idx = res.get("index")
-                if idx is not None:
-                    rr[str(idx)] = {"index": idx, "level": res.get("level", "没问题"), "reason": res.get("reason", "")}
-            part_data = {}
-            for res2 in results:
-                idx2 = res2.get("index")
-                if idx2 is not None:
-                    part_data[str(idx2)] = {"index": idx2, "level": res2.get("level", "没问题"), "reason": res2.get("reason", "")}
+                key = str(idx)
+                rr[key] = res
+                part_data[key] = res
             if part_data:
                 cd2 = _proofread_checkpoint_dir(output_dir, sheet_name)
                 cd2.mkdir(parents=True, exist_ok=True)
@@ -456,9 +527,8 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
                 _update_phase2_progress(output_dir, sheet_name, tag, total_batches, orig_bn, rnd)
             _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 完成 ({success_count} 條) [{cfg.api_id} {cfg.model}]")
         except Exception as e:
-            es = str(e).lower()
-            if "429" in es or "rate" in es:
-                cfg.mark_429()
+            if is_rate_limit_error(e):
+                pool.note_429(cfg)
                 if cfg.is_permanently_disabled:
                     print(f"  [{cfg.api_id}] 429，永久停用")
                 else:
@@ -477,19 +547,34 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
     try:
         await asyncio.gather(*[pool.submit(fbn, task, process_batch, ctx=task) for fbn, task in enumerate(all_tasks, 1)])
     except RuntimeError as e:
+        # 不可吞掉：吞掉會讓 P2 從未真正執行，但工作表仍被標記完成、
+        # checkpoint 與 session 一併被清除，使用者無法續傳補做
         if "all APIs permanently disabled" in str(e):
             print("  ⚠️ 所有 API 已永久停用，Phase 2 評估中斷")
             print(f"  P2 部分進度已保留（R1 {len(rr1)} 條），續傳時會從未完成批次繼續")
-            return df, []
         raise
     round1_results = deepcopy(rr1)
     round2_results = deepcopy(rr2)
     _save_phase2_results(output_dir, sheet_name, round1_results, round2_results)
     _delete_phase2_progress(output_dir, sheet_name)
     second_category = []
+    default_r2 = {"level": "严重", "reason": "评估缺失，预设为严重"}
+    skipped = 0
     for idx_str, r1r in round1_results.items():
-        idx = int(idx_str)
-        r2r = round2_results.get(idx_str, {"level": "严重", "reason": "评估缺失，预设为严重"})
+        # 續傳時 round1_results 來自 part 檔：單筆壞資料只跳過該筆
+        try:
+            idx = int(idx_str)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if not isinstance(r1r, dict):
+            skipped += 1
+            continue
+        r2r = round2_results.get(idx_str, default_r2)
+        if not isinstance(r2r, dict):
+            r2r = default_r2
+        r1r = _normalize_eval_entry(r1r, idx)
+        r2r = _normalize_eval_entry(r2r, idx)
         if _cross_reference(r1r, r2r):
             if idx in df.index:
                 row = df.loc[idx]
@@ -500,6 +585,8 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
                     "round1": r1r,
                     "round2": r2r,
                 })
+    if skipped:
+        print(f"  警告：P2 評估結果有 {skipped} 筆無效資料（非數字 key 或非物件），已略過")
     print(f"  P2 完成：{len(second_category)} 條第二類問題")
     return df, second_category
 
@@ -549,6 +636,9 @@ async def _polish_batch(client, model, batch, glossary, api_id):
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\n```$", "", text)
             results = json.loads(text)
+            # 有些供應商 HTTP 200 但 body 是限流錯誤物件 → 當成 429 往上拋
+            if is_rate_limit_payload(results):
+                raise RateLimitPayloadError(f"429 rate limit in response payload: {text[:200]}")
             if isinstance(results, dict):
                 known_keys = ["translations", "translated", "data", "results"]
                 for key in known_keys:
@@ -620,6 +710,9 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                 repaired = repair_json(text)
                 if repaired:
                     results = json.loads(repaired)
+                    if is_rate_limit_payload(results):
+                        raise RateLimitPayloadError(
+                            f"429 rate limit in response payload: {str(results)[:200]}")
                     print(f"    [{api_id}] ⚠️ JSON 修復成功")
                     if isinstance(results, dict):
                         if "translations" in results:
@@ -650,6 +743,9 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                             print(f"    [{api_id}] 警告：JSON 陣列中缺少 index/translation 字段")
                             print(f"    回傳內容前 200 字: {text[:200]}")
                         return results
+            except RateLimitPayloadError:
+                # 修復後的內容仍是限流錯誤包裝 → 不可被吞掉，要往上拋成 429
+                raise
             except Exception:
                 pass
         except ValueError as e:
@@ -657,7 +753,7 @@ async def _polish_batch(client, model, batch, glossary, api_id):
             if attempt < 2:
                 await asyncio.sleep(3)
         except Exception as e:
-            if "429" in str(e).lower() or "rate" in str(e).lower():
+            if is_rate_limit_error(e):
                 raise
             print(f"    [{api_id}] API \u932f\u8aa4 (\u5617\u8a66 {attempt + 1}/3): {e}")
             if attempt < 2:
@@ -686,19 +782,43 @@ def _save_polish_checkpoint(output_dir, sheet_name, backup_data, rnd, failed_ind
 def _apply_polish_from_checkpoint(df, output_dir, sheet_name):
     fp = _proofread_checkpoint_dir(output_dir, sheet_name) / "polish_results.json"
     if fp.exists():
+        restored = 0
+        skipped = 0
         try:
             data = json.loads(fp.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "rounds_completed" in data:
                 backup = data.get("data", {})
             else:
                 backup = data
+            if not isinstance(backup, dict):
+                print("    警告：潤色檢查點結構異常（非物件），略過還原")
+                return df
             for idx_str, trans in backup.items():
-                idx = int(idx_str)
+                # 檢查點損壞或人為編輯：單筆壞資料只跳過該筆，不可讓其餘還原全部失效
+                try:
+                    idx = int(idx_str)
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                if not (isinstance(trans, str) and trans.strip()):
+                    skipped += 1
+                    continue
+                # 缺值哨兵（"nan"/"nat"/"none"，含 pd.NA 等 NA 純量）不是有效譯文：
+                # 還原進 df 會被下游當成「已有譯文」，例如快速校對的 completed-sheet
+                # 還原之後不再重譯，哨兵值會直接寫進輸出檔。
+                # english= 一律走 _english_hint_at：英文欄的 NaN 不可變成字串 "nan" 而豁免。
+                if is_missing_translation(trans, english=_english_hint_at(df, idx)):
+                    skipped += 1
+                    continue
                 if idx in df.index:
+                    # 潤色結果是本輪最新成果，理當覆蓋工作表中的舊譯文
                     df.at[idx, "translation"] = trans
-            print(f"    從 checkpoint 還原 {len(backup)} 條潤色結果")
-        except Exception:
-            pass
+                    restored += 1
+            if skipped:
+                print(f"    警告：潤色檢查點有 {skipped} 筆無效資料（非數字 key、非字串譯文或缺值哨兵），已略過")
+            print(f"    從 checkpoint 還原 {restored} 條潤色結果")
+        except Exception as e:
+            print(f"    警告：潤色檢查點還原失敗（已略過）：{e}")
     return df
 
 
@@ -715,9 +835,16 @@ def _get_polish_round(output_dir, sheet_name) -> int:
     return 0
 
 
-def _is_empty_translation(trans) -> bool:
-    """譯文是否為空／缺失（P3 只對這類條目重試）。"""
-    return trans is None or (isinstance(trans, float) and pd.isna(trans)) or str(trans).strip() == ""
+def _is_empty_translation(trans, english=None) -> bool:
+    """譯文是否為空／缺失（P3 只對這類條目重試）。
+
+    與 P2／P4 同口徑：直接沿用 `is_missing_translation`（含 pd.NA／NaT、
+    空字串與字串 "nan"/"nat"/"none"）。舊寫法只認 None／float NaN／空字串，
+    於是同一格在 P3 被當成「已有譯文」而略過、在 P2／P4 卻被當成缺值。
+    english：該列英文原文，原文真的是這些字時不算缺值（由 _english_hint 過濾，
+    避免把 NaN 轉出來的 "nan" 誤當成原文）。
+    """
+    return is_missing_translation(trans, english=_english_hint(english))
 
 
 def _has_polish_checkpoint(output_dir, sheet_name) -> bool:
@@ -732,7 +859,20 @@ def _get_polish_failed_indices(output_dir, sheet_name) -> list:
             data = json.loads(fp.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 failed = data.get("failed_indices", [])
-                return sorted(int(i) for i in failed)
+                if not isinstance(failed, list):
+                    print("    警告：潤色檢查點的 failed_indices 非陣列，視為空")
+                    return []
+                # 單一壞索引只跳過該筆，其餘仍要能續傳
+                indices = []
+                skipped = 0
+                for i in failed:
+                    try:
+                        indices.append(int(i))
+                    except (TypeError, ValueError):
+                        skipped += 1
+                if skipped:
+                    print(f"    警告：failed_indices 有 {skipped} 筆非數字，已略過")
+                return sorted(indices)
         except Exception:
             pass
     return []
@@ -745,7 +885,8 @@ def _resume_polish_indices(all_indices, df, failed_indices) -> list:
     for idx in all_indices:
         if idx not in df.index:
             continue
-        if idx in failed or _is_empty_translation(df.at[idx, "translation"]):
+        eng = df.at[idx, "english"] if "english" in df.columns else None
+        if idx in failed or _is_empty_translation(df.at[idx, "translation"], eng):
             result.append(idx)
     return sorted(result)
 
@@ -801,25 +942,34 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
                     if not isinstance(res, dict):
                         skipped += 1
                         continue
-                    idx = res.get("index")
-                    trans = res.get("translation")
-                    if idx is not None and trans is not None:
+                    # 單筆格式異常只影響該筆，不可讓整個批次的其他潤色結果一起損失
+                    try:
+                        idx = res.get("index")
+                        trans = res.get("translation")
+                        # 只有非空字串才可寫入 translation 欄（dict／數字會在 str dtype 拋錯）；
+                        # 缺值哨兵也不是譯文（與三條還原守門同口徑），跳過讓該列維持缺值重試
+                        if (idx is None or not isinstance(trans, str) or not trans.strip()
+                                or is_missing_translation(trans, english=_english_hint_at(df, idx))):
+                            skipped += 1
+                            continue
                         if idx in df.index:
                             df.at[idx, "translation"] = trans
                             new_backup[str(idx)] = str(trans)
                             all_backup[str(idx)] = str(trans)
                         else:
                             skipped += 1
+                    except (TypeError, ValueError) as e:
+                        skipped += 1
+                        print(f"  [{cfg.api_id}] 警告：略過無效潤色回傳（index={res.get('index')!r}）：{e}")
                 if skipped:
-                    print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件或 index 不在工作表中），已忽略")
+                    print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件、index 不在工作表中或譯文非字串），已忽略")
                 if new_backup:
                     save_backup_part(output_dir, tag, bn, new_backup, sheet_name)
                     sync_progress(output_dir, sheet_name)
                 _timestamp(f"P3 批次 {bn}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
             except Exception as e:
-                es = str(e).lower()
-                if "429" in es or "rate" in es:
-                    cfg.mark_429()
+                if is_rate_limit_error(e):
+                    pool.note_429(cfg)
                     if cfg.is_permanently_disabled:
                         print(f"  [{cfg.api_id}] 429，永久停用")
                     else:
@@ -863,7 +1013,8 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
                     continue
                 trans = df.at[idx, "translation"]
                 # 重送「譯文仍為空」或「本輪失敗但保留舊譯文」的條目
-                if _is_empty_translation(trans) or idx in failed:
+                eng = df.at[idx, "english"] if "english" in df.columns else None
+                if _is_empty_translation(trans, eng) or idx in failed:
                     remaining.add(idx)
 
             current_indices = sorted(remaining)
@@ -889,8 +1040,7 @@ def _delete_proofread_checkpoint(output_dir):
 def _save_debug_info(api_id, model, batch_size, returned, success, text):
     import uuid
     from datetime import datetime
-    debug_dir = Path(__file__).parent / "workplace" / "_debugmessage"
-    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = get_debug_message_dir()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     uid = uuid.uuid4().hex[:4]
     (debug_dir / f"debug_{ts}_{uid}.json").write_text(
@@ -912,10 +1062,9 @@ async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     # Compute relevant glossary (same logic as enforcer.enforce())
     all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
     _ctx = build_relevance_context(all_text)
-    relevant_glossary = {
-        e: c for e, c in glossary.items()
-        if find_term_spans(e, all_text, _ctx)
-    }
+    relevant_glossary = filter_relevant_terms(glossary, all_text, _ctx)
+    # 上界只是「不會漏」；收斂成真正命中的集合，讓後續掃描回到精確成本
+    relevant_glossary = narrow_relevant_glossary(df, relevant_glossary)
     # Run retry directly in current event loop with the shared pool
     if pool is not None:
         df = await _enforce_async(df, relevant_glossary, output_dir=output_dir, sheet_name=sheet_name, shared_pool=pool)
@@ -924,7 +1073,9 @@ async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     review_rows = []
     for idx, row, issues in final_pool:
         trans = row.get("translation")
-        trans_str = str(trans) if not (trans is None or (isinstance(trans, float) and pd.isna(trans))) else ""
+        # 審查報告的「目前譯文」不可出現 "<NA>"／"nan" 這類缺值字面值
+        trans_str = "" if is_missing_translation(
+            trans, english=_english_hint(row.get("english"))) else str(trans)
         for issue_type, suggested_fix, desc in issues:
             review_rows.append({
                 "english": str(row.get("english", "")),
@@ -948,6 +1099,35 @@ def backup_target_file(excel_path):
     print(f"  備份已建立：{backup_path}")
     return backup_path
 
+
+
+def _dedup_report_rows(df: pd.DataFrame, subset, label: str) -> pd.DataFrame:
+    """報告列去重：同一個問題（工作表＋原文＋問題描述）只保留最後一筆。
+
+    同一個問題可能因多輪重譯或多次續傳被記錄多次（all_review_rows 逐輪串接，
+    續傳時 session 的 accumulated_review_rows 再疊一次），報告因此出現重複列。
+    後面的記錄才是最新一輪的結果，故 keep="last"。
+
+    去重鍵另外納入譯文欄位（若存在）：同一工作表內同一句原文可能出現在不同列，
+    只有問題描述相同、譯文不同時，那兩列是**不同的複查對象**，不可合併，
+    否則使用者會看不到其中一列的問題。欄位缺失或值不可雜湊時退回原始資料，
+    不讓報告產生流程失敗。
+    """
+    try:
+        subset = list(subset) + [
+            c for c in ("original_translation", "current_translation", "new_translation")
+            if c in df.columns and c not in subset
+        ]
+        if not set(subset).issubset(df.columns):
+            return df
+        before = len(df)
+        out = df.drop_duplicates(subset=list(subset), keep="last").reset_index(drop=True)
+    except (TypeError, ValueError, KeyError) as e:
+        print(f"    警告：{label} 去重失敗（保留原始列）：{e}")
+        return df
+    if len(out) != before:
+        print(f"    {label} 去重：{before} → {len(out)} 條（同工作表＋原文＋問題描述＋譯文保留最後一筆）")
+    return out
 
 
 def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_second_category, all_review_rows: list[pd.DataFrame], output_dir, overall_start):
@@ -984,6 +1164,7 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
         rdf = pd.DataFrame(all_report_rows)
         rcols = ["sheet_name", "english", "original_translation", "new_translation", "remark"]
         rdf = rdf[rcols]
+        rdf = _dedup_report_rows(rdf, ["sheet_name", "english", "remark"], "proofread_report")
         rp = Path(output_dir) / "proofread_report.xlsx"
         with pd.ExcelWriter(rp, engine="openpyxl") as writer:
             rdf.to_excel(writer, index=False, sheet_name="Sheet1")
@@ -1025,6 +1206,8 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
         print(f"  proofread_report.xlsx 已寫入：{rp}（{len(rdf)} 條）")
     if all_review_rows:
         combined = pd.concat(all_review_rows, ignore_index=True)
+        # 對應欄位名是 issue（不叫 remark）；同一問題只保留最後一筆
+        combined = _dedup_report_rows(combined, ["sheet_name", "english", "issue"], "review_report_proofread")
         rvp = Path(output_dir) / "review_report_proofread.xlsx"
         with pd.ExcelWriter(rvp, engine="openpyxl") as writer:
             combined.to_excel(writer, index=False, sheet_name="Sheet1")
@@ -1158,7 +1341,18 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
         [], pending_sheets, sheet_configs))
     # Phase barrier: all sheets run each phase in parallel through the shared pool.
     pool = SharedBatchPool()
-    await pool.start()
+    try:
+        await pool.start()
+    except RuntimeError:
+        # 只清除本次剛寫入的 session；不可刪整個 _proofread_checkpoint，
+        # 那會把先前未完成（可續傳）的進度一起清掉（與 run_quick_proofread 同口徑）
+        _sf = _proofread_checkpoint_dir(str(workplace)) / SESSION_FILE
+        if _sf.exists():
+            try:
+                _sf.unlink()
+            except OSError:
+                pass
+        raise
     active = [c for c in pool.api_configs if not c.is_permanently_disabled]
     print(f"  已載入 {len(active)} 個可用 API：")
     for cfg in active:
@@ -1373,11 +1567,28 @@ def _restore_enforce_backup(df, output_dir, sheet_name) -> int:
         except Exception:
             pass
     restore_count = 0
+    skipped = 0
     for idx_str, trans in backup.items():
-        idx = int(idx_str)
+        # 備份檔損壞或人為編輯：單筆壞資料只跳過該筆，不可讓整個工作表還原失敗
+        try:
+            idx = int(idx_str)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if not (isinstance(trans, str) and trans.strip()):
+            skipped += 1
+            continue
+        # 缺值哨兵（"nan"/"nat"/"none"，含 pd.NA 等 NA 純量）不是有效譯文：
+        # 還原進 df 會讓該列被下游誤認為已有譯文（同 _apply_polish_from_checkpoint）
+        if is_missing_translation(trans, english=_english_hint_at(df, idx)):
+            skipped += 1
+            continue
         if idx in df.index:
+            # 重譯備份是上一次中斷前較新的修正結果，理當覆蓋工作表中的舊譯文
             df.at[idx, "translation"] = trans
             restore_count += 1
+    if skipped:
+        print(f"    警告：重譯備份有 {skipped} 筆無效資料（非數字 key、非字串譯文或缺值哨兵），已略過")
     return restore_count
 
 
@@ -1406,6 +1617,8 @@ def generate_quick_reports(excel_path, all_translated_dfs, all_review_rows: list
         combined = pd.concat(all_review_rows, ignore_index=True)
     else:
         combined = pd.DataFrame(columns=["sheet_name", "english", "current_translation", "category", "issue"])
+    # 對應欄位名是 issue；同一問題只保留最後一筆（多輪／多次續傳會重複記錄）
+    combined = _dedup_report_rows(combined, ["sheet_name", "english", "issue"], "quick_proofread_report")
     with pd.ExcelWriter(rp, engine="openpyxl") as writer:
         combined.to_excel(writer, index=False, sheet_name="Sheet1")
         ws = writer.sheets["Sheet1"]
@@ -1473,10 +1686,14 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
     try:
         await pool.start()
     except RuntimeError:
-        qcp = _quick_checkpoint_dir(str(workplace))
-        if qcp.exists():
-            import shutil
-            shutil.rmtree(qcp)
+        # 只清除本次剛寫入的 session；不可 rmtree 整個 _quick_checkpoint，
+        # 那會把先前已完成工作表的 translations.json / _all_done 一起刪掉
+        _sf = _quick_checkpoint_dir(str(workplace)) / SESSION_FILE
+        if _sf.exists():
+            try:
+                _sf.unlink()
+            except OSError:
+                pass
         raise
     active = [c for c in pool.api_configs if not c.is_permanently_disabled]
     print(f"  已載入 {len(active)} 個可用 API：")
@@ -1494,11 +1711,31 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
                 df_full = df_original.copy()
                 saved = _load_quick_sheet_translations(str(workplace), sheet_name)
                 restore_count = 0
+                skipped = 0
+                if not isinstance(saved, dict):
+                    print(f"    警告：{sheet_name} 的快速校對檢查點結構異常（非物件），略過還原")
+                    saved = {}
                 for idx_str, trans in saved.items():
-                    idx = int(idx_str)
+                    # 檢查點損壞或人為編輯：單筆壞資料只跳過該筆，不可讓整個工作表還原失敗
+                    try:
+                        idx = int(idx_str)
+                    except (TypeError, ValueError):
+                        skipped += 1
+                        continue
+                    if not (isinstance(trans, str) and trans.strip()):
+                        skipped += 1
+                        continue
+                    # 缺值哨兵（"nan"/"nat"/"none"，含 pd.NA 等 NA 純量）不是有效譯文：
+                    # 這條路徑還原後不再重譯，哨兵值會直接寫進輸出檔
+                    if is_missing_translation(trans, english=_english_hint_at(df_full, idx)):
+                        skipped += 1
+                        continue
                     if idx in df_full.index:
+                        # 快速校對結果是本輪最新成果，理當覆蓋來源檔的舊譯文
                         df_full.at[idx, "translation"] = trans
                         restore_count += 1
+                if skipped:
+                    print(f"    警告：{sheet_name} 檢查點有 {skipped} 筆無效資料（非數字 key、非字串譯文或缺值哨兵），已略過")
                 if restore_count > 0:
                     print(f"    從 checkpoint 還原 {restore_count} 條修正")
                 rows = _load_quick_sheet_review(str(workplace), sheet_name)
@@ -1544,7 +1781,11 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
             saved = {}
             for idx in df.index:
                 trans = df.at[idx, "translation"]
-                if trans is not None:
+                # NaN 不是 None：只判 is not None 會把空譯文存成字串 "nan"。
+                # english= 必須用 _english_hint_at：直接 str() 會把缺值的英文欄
+                # 變成字串 "nan"／"None"，讓字面譯文 "nan" 被誤判成合法譯文；
+                # 該函式同時處理「沒有 english 欄」與「索引重複回 Series」的情況
+                if not is_missing_translation(trans, english=_english_hint_at(df, idx)):
                     saved[str(idx)] = str(trans)
             _save_quick_sheet_translations(str(workplace), sheet_name, saved)
             if review_df is not None and not review_df.empty:

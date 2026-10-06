@@ -8,8 +8,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from glossary import load_glossary, auto_extract_glossary
-from llm_translator import delete_checkpoint_files
+from glossary import load_glossary, auto_extract_glossary, MISSING_SENTINELS
+from llm_translator import delete_checkpoint_files, get_debug_message_dir
 from proofreader import (run_proofread, run_quick_proofread,
                          _load_session, _load_quick_session,
                          _proofread_checkpoint_dir, _quick_checkpoint_dir)
@@ -22,7 +22,9 @@ def _get_workplace():
     return wp
 
 def timestamp(msg):
-    print(f"  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] {msg}")
+    # 內層字串用單引號：同一種引號嵌套的 f-string 是 Python 3.12（PEP 701）才合法，
+    # 在 3.10/3.11 會 SyntaxError（本檔最低支援版本為 3.10）
+    print(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 def elapsed(start, label):
     secs = (datetime.now() - start).total_seconds()
@@ -146,6 +148,25 @@ def step3(excel_path):
         sys.exit(1)
     return selected
 
+def translated_mask(df: pd.DataFrame) -> pd.Series:
+    """回傳「該列已有可用譯文」的布林 Series（缺值／哨兵／空白都不算）。
+
+    這是全模組唯一的「已翻譯」判定，step4 與上層的計數都必須用它，
+    否則同一個畫面會出現兩個互相矛盾的數字（先前 line 352 用 `~isna()`，
+    純空白與 "nat"/"none" 會被算成已翻譯、與 step4 不一致）。
+
+    注意：真正兜住 NA 的是 `notna()` —— pandas 3.0 的 `Series.astype(str)`
+    會把缺值保留成 float NaN（不會變成 "nan"／"<NA>" 字串），
+    所以 `isin(MISSING_SENTINELS)` 與 `strip() != ""` 對 NA 都不成立。
+    """
+    if "translation" not in df.columns:
+        return pd.Series([False] * len(df), index=df.index)
+    s = df["translation"].astype(str)
+    return (df["translation"].notna()
+            & ~s.str.strip().str.lower().isin(MISSING_SENTINELS)
+            & (s.str.strip() != ""))
+
+
 def step4(excel_path, sheet_name, df=None):
     if df is None:
         df = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
@@ -155,7 +176,8 @@ def step4(excel_path, sheet_name, df=None):
     trans_indices = []
     trans_ranges = []
     if "translation" in df.columns:
-        mask = df["translation"].notna() & (df["translation"].astype(str).str.lower() != "nan") & (df["translation"].astype(str).str.strip() != "")
+        # 哨兵集合與 is_missing_translation 共用（原本只擋 "nan"，"nat"/"none" 會被誤算成已翻譯）
+        mask = translated_mask(df)
         trans_indices = list(df.index[mask])
         if trans_indices:
             s = trans_indices[0]
@@ -258,7 +280,7 @@ def main():
         print("  無效輸入，請重新輸入。")
 
     # ── 檢查上次的 debug 訊息 ──
-    debug_dir = _get_workplace() / "_debugmessage"
+    debug_dir = get_debug_message_dir(create=False)
     if debug_dir.exists():
         debug_files = sorted(debug_dir.glob("debug_*.json"))
         if debug_files:
@@ -343,7 +365,7 @@ def main():
         df_full = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
         cached_dfs[sn] = df_full
         if "translation" in df_full.columns:
-            has_t = (~df_full["translation"].isna()).sum()
+            has_t = int(translated_mask(df_full).sum())
             print(f"    總行數: {len(df_full)}，有翻譯: {has_t}")
         sel = step4(excel_path, sn, df_full)
         sheet_configs[sn] = {"selected_indices": sel}
@@ -368,7 +390,7 @@ if __name__ == "__main__":
         main()
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
-            print("\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續。")
+            print("\n  ⚠️ 所有 API 已永久停用（累計 429 限流達門檻；只有一個可用 API 時門檻會放寬），無法繼續。")
             print("  已儲存部分校對進度，請檢查 API Key 後重新執行即可續傳。")
             input("\n按 Enter 鍵...")
         else:

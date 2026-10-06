@@ -9,14 +9,14 @@
 ## Overview
 
 An AI-powered automated pipeline designed for large-scale game text translation. Scripts can be placed anywhere — no specific project structure required.
-
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 12/8/2026, see [Changelog](Changelog.md) for details
-- **Multi-word term fix**: positional matching for terms with 3+ words (e.g. White Wolf Mountain) no longer misses matches, so long terms enter relevance filtering and enforcement correctly
-- **`{}` placeholder support**: template matching now supports the `{}` shorthand, treated as `{0}` when filling
-- **Concurrency setting guard**: `PARALLEL_LIMIT` set to 0 or negative no longer hangs forever; it warns and falls back to the category default
-- **Code cleanup**: removed unused imports, added type annotations, and tidied up parts of the flow
+## Latest Update v0.4.5 (6/10/2026), see [Changelog](Changelog.md) for details
+- **Large-sheet scan speedup**: the term gate now uses a safe upper bound plus a per-row narrowing step; 178 KB of text went from 34.6s to 0.2s (7 MB sheets went from minute-class to seconds; with a very large glossary the old code could take hours)
+- **More accurate term matching**: multi-word terms now enforce word boundaries and use rule-based plural forms (new matches such as `White wolf` / "white wolves" and `person` / "people", while false positives like `Attack mix(2)` and `Black 2h sword` are gone); terms containing brackets/digits/dots now match at all
+- **429 and shared-pool hardening**: detection is now a single implementation (429 status code, the `rate limit` family, `too many requests` / `quota exceeded`) and every 429 restarts a 60-second cooldown; fixed `close()` leaving forever-pending futures and a cooldown requeue that could drop a running job
+- **Unified missing-value checks**: `pd.NA` / `NaT` no longer break prompt JSON; `nan` / `nat` / `none` markers in old checkpoints or backups are no longer restored as translations; report deduplication covers every output
+- **Python version**: this release explicitly requires **Python 3.10 or later**
 
 ### Features
 
@@ -24,10 +24,10 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 - **Enforced terminology accuracy**: With script assistance, AI achieves **99%+ accuracy** on proper nouns such as character names, locations, and item names. In contrast, tools like Gemini's Gem feature or Qwen's project feature still have a non-negligible rate of mistranslating proper nouns, even with well-crafted prompts.
 - **Interactive operation**: Supports selecting sheets and entry ranges
 - **Async concurrency**: Sends multiple API requests simultaneously, significantly reducing translation time
-- **Multi-worksheet parallelism**: All worksheets run concurrently within each phase, with phase-barrier synchronization; one shared API batch pool keeps 429 state consistent across the run
 - **Checkpoint resume**: If the translation is interrupted due to network issues or manual interruption (Ctrl+C), simply re-run the script to resume from where it left off — no need to start over
+- **Multi-worksheet parallelism**: All worksheets run concurrently within each phase, with phase-barrier synchronization; one shared API batch pool keeps 429 state consistent across the run
 - **Auto-review**: Four-layer checks (terminology / placeholders / untranslated / spacing), generates a color-coded review report
-- **Multi-API support**: Supports using multiple API keys simultaneously (main/fallback classification), round-robin task distribution, automatic 429 rate-limit handling (cooldown/permanent disable), maximizing translation throughput
+- **Multi-API support**: Supports using multiple API keys simultaneously (main/fallback classification), tasks going into one shared queue that whichever API is free pulls from first, and automatic 429 rate-limit handling (every 429 restarts a 60-second cooldown, permanent disable only at the threshold, and the threshold is relaxed automatically when only one usable API remains), maximizing translation throughput
 - **Automated proofreading workflow**: LLM dual-round evaluation cross-validation + up to 3 rounds of polishing + retranslation protection, produces color-coded proofreading reports
 - **Glossary-based proofreading**: Enforces glossary during proofreading to prevent the LLM from deviating from correct terminology when polishing
 
@@ -41,7 +41,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
 | `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
-| enforcer.py | **Four-layer enforcement** (terminology/placeholders/untranslated/spacing), with script preprocessing, auto-correction + color-coded review report |
+| `enforcer.py` | **Four-layer enforcement** (terminology/placeholders/untranslated/spacing), with script preprocessing, auto-correction + color-coded review report |
 | `shared_pool.py` | **Shared batch pool** - one set of API configs, concurrency and 429 state for the whole run |
 | `api_config.py` | Multi-API configuration parser, supports main/fallback classification, category-level default concurrency, per-API overrides |
 | `.env` | API configuration file, supports multi-API numbered format and legacy single-API format |
@@ -88,6 +88,8 @@ batch_proofread.py → after choosing "Quick Proofread", only:
 
 ## Installation
 
+**Requirement: Python 3.10 or later** (3.10 / 3.11 / 3.12 / 3.13 all work; this project is developed and tested on Python 3.13). Versions below 3.10 will fail to start because of unsupported syntax.
+
 ```bash
 pip install openpyxl pandas openai python-dotenv json-repair
 ```
@@ -114,7 +116,7 @@ Copy `.env.example` to `.env` and fill in your settings. Two formats are support
 ```env
 # Main API (paid, default concurrency=10)
 API1_TYPE=main
-API1_PARALLEL_LIMIT=x (Add this parameter with a number if you want to set a custom concurrency limit)
+# API1_PARALLEL_LIMIT=10   <- optional: uncomment to set a custom concurrency
 API1_MODEL_PROVIDER=openrouter
 API1_MODEL=deepseek/deepseek-v4-flash
 API1_API_KEY=sk-your_api_key_here
@@ -122,7 +124,7 @@ API1_BASE_URL=https://openrouter.ai/api/v1
 
 # Fallback API (free, default concurrency=1)
 API2_TYPE=fallback
-API2_PARALLEL_LIMIT=x (Add this parameter with a number if you want to set a custom concurrency limit)
+# API2_PARALLEL_LIMIT=1    <- optional: uncomment to set a custom concurrency
 API2_MODEL_PROVIDER=nvidia
 API2_MODEL=deepseek-ai/deepseek-v4-flash
 API2_API_KEY=nvapi-your_free_key_here
@@ -136,7 +138,7 @@ MODEL_PROVIDER=openrouter
 MODEL=deepseek/deepseek-v4-flash
 BASE_URL=https://openrouter.ai/api/v1
 ```
-> Both formats can coexist — if `API1_` settings are detected, the multi-API format takes priority. Each API can optionally set `APIx_PARALLEL_LIMIT` to override the category default. Main API default concurrency=10, fallback API default concurrency=1.
+> Both formats can coexist — if **any `APIx_` block parses successfully** (the numbering may have gaps, e.g. only `API1_` and `API3_`), the multi-API format is used; if every `APIx_` block is skipped for missing required fields, it falls back to the legacy single-API format. Each API can optionally set `APIx_PARALLEL_LIMIT` to override the category default. Main API default concurrency=10, fallback API default concurrency=1. `.env` is loaded from the script's own directory, independent of the working directory you launch it from.
 
 ---
 
@@ -163,6 +165,7 @@ All output files are placed under the `workplace/` directory:
 |------|------|
 | `{source_name}_translated_output.xlsx` | **Completed translation file**, located in `workplace/` |
 | `review_report.xlsx` | **Review report** (entries needing manual review), located in `workplace/` |
+| `auto_glossary_for_review.xlsx` | **Review list for the auto-extracted glossary**, located in `workplace/` (only produced when "auto-extract" is chosen; an empty file is still written when nothing was extracted) |
 | `_checkpoint/` | **Checkpoint resume temp directory**, located in `workplace/` (auto-deleted after completion) |
 
 ---
@@ -189,6 +192,7 @@ Step 5: Confirm execution      → Starts proofreading (Phase 2→3→4a→4b→
 | `{source_name}_proofread_output.xlsx` | **Proofread Excel file** |
 | `proofread_report.xlsx` | **Proofreading summary report** (Type1/Type2 color-coded) |
 | `review_report_proofread.xlsx` | **Retranslation protection review details** |
+| `auto_glossary_for_review.xlsx` | **Review list for the auto-extracted glossary**, located in `workplace/` (only produced when "auto-extract" is chosen; an empty file is still written when nothing was extracted) |
 | `_proofread_checkpoint/` | **Checkpoint resume temp directory**, located in `workplace/` (auto-deleted after completion) |
 | `{source_name}_quick_proofread_output.xlsx` | **Quick-proofread Excel file** (retranslation fixes only) |
 | `quick_proofread_report.xlsx` | **Quick proofread report** (four mechanical issue types, color-coded) |
@@ -208,15 +212,15 @@ If the translation/proofreading is interrupted due to network issues, API errors
 
 ```
 ============================================================
-  Unfinished translation progress detected
+  Unfinished translation progress detected!
 ============================================================
   Excel: transcript_zh.xlsx
-  Worksheet: dialogue_experimental
-  Progress: 504/1000 entries
+  Worksheet progress: 1/3 sheets
+  Current sheet: dialogue
   Glossary: glossary.xlsx
 ============================================================
 
-Resume the previous translation? (Y/n):
+Resume translation? (Y/n):
 ```
 
 5. Choose `Y` → automatically loads glossary settings, restores translated/proofread entries, and resumes from the interruption point
@@ -267,7 +271,7 @@ IGNORE_LIST: set[str] = {
 
 **How to add entries:**
 - Any common English word you don't want checked as terminology can be added
-- Adding a word also matches its **singular/plural/case** forms (e.g., adding `Egg` automatically filters `Eggs`, `EGGS`)
+- Adding a word also matches its **singular/plural/case** forms (e.g., adding `Egg` automatically filters `Eggs`, `EGGS`; conversely, listing a plural such as `Cages` also ignores the singular `Cage`). Words ending in `-ses` are inherently ambiguous (e.g. `buses`→`bus`, while `bus` itself normalizes to `bu`), so use the same form in both the glossary and the list.
 - Entries with the same name already in the Excel glossary will also be ignored
 
 ---
@@ -277,6 +281,8 @@ IGNORE_LIST: set[str] = {
 ⚠️ **This feature is not yet enabled** (the `TEMPLATES` list is empty). All entries are currently handled entirely by AI translation.
 
 Template matching will be added in the **official release**. Users will then be able to define regex templates for automatic translation fill-in (e.g., `"Talk to (.+?)\."` → `"与{0}对话。"`), reducing the number of API calls. Interested users can refer to the comments in `tm_matcher.py` to learn the syntax in advance.
+
+Fill-in rules: `{}` placeholders map to `{0}{1}...` in order (the first `{}` is `{0}`), and you can also write `{0}{1}` yourself to control word order. If a template cannot be filled completely (more placeholders than captured arguments, or an out-of-range index) it is **not applied** and the entry goes to the AI instead (a literal `{2}` is never written into a translation).
 
 ---
 
@@ -291,7 +297,11 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 | `FALLBACK_DEFAULT_LIMIT` | 1 | Fallback API default concurrency (api_config.py) |
 | `REQUEST_INTERVAL` | 1 | Interval in seconds between requests from the same API (api_config.py) |
 | `API_TIMEOUT` | 3600 | Unified timeout in seconds for all LLM requests (api_config.py) |
-| `PERMANENT_DISABLE_AFTER` | 2 | Permanently disable an API after the Nth 429 (api_config.py) |
+| `PERMANENT_DISABLE_AFTER` | 2 | Permanently disable an API after the Nth 429 (api_config.py); relaxed dynamically when only one usable API remains (see below) |
+| `SINGLE_API_EXTRA_429_TOLERANCE` | 3 | Extra 429s tolerated when only one usable API remains: threshold = your configured value + 3 (default 5). It reverts as soon as another API is usable again (reversible; never overrides a value you raised or lowered) |
+| `OVER_RETURN_TOLERANCE` | 1.2 | A batch is treated as failed and retried when it returns more than 1.2x the requested entry count (api_config.py) |
+
+> What counts as a 429: the 429 status code, a standalone `429` in the message, the `rate limit` family (`rate limit` / `rate_limit` / `rate-limit` / `ratelimit`), plus `too many requests` and `quota exceeded`. Any detected 429 **restarts** the 60-second cooldown (the timer resets every time) and the API is permanently disabled only after reaching the threshold.
 
 > When adjusting concurrency: you can set `APIx_PARALLEL_LIMIT` in `.env` for individual APIs, or modify the category defaults in `api_config.py`. Setting it too high may trigger API endpoint rate limits. The defaults of main=10 and fallback=1 have been tested as the optimal balance point.
 
@@ -299,29 +309,24 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 
 ## Performance Reference
 
-### Benchmarks (DeepSeek V4 Flash, evening hours)
+### Large-sheet scanning (term matching)
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| Term gate (178 KB of text) | 34.6s | 0.2s |
+| Term gate (2.85 MB of text) | minutes or more | about 3.4s (linear in text length) |
+| `scan_issues` (1,000 rows, full glossary) | 4.33s | 0.95s |
+
+> The difference grows with glossary size: the old cost was proportional to "terms x text length", while the new path uses a safe upper bound plus per-row narrowing, producing exactly the same issue sets and batch prompts.
+
+### DeepSeek V4 Flash Benchmarks (cache 0.02 RMB/input 1 RMB/output 2 RMB)
 
 | Entries | Avg Cost (Translation) | Translation Time (3 runs) | Avg Cost (Proofreading) | Proofreading Time (3 runs) |
 |---------|---------------|----------------|----------|----------------|
 | 500 | 0.01-0.02 USD | 329s, 467s, 353s | 0.02 USD | 350s, 387s, 461s |
 | 2,000 | 0.06-0.07 USD | 801s, 746s, 696s | 0.07-0.08 USD | 912s, 1243s |
-| 5,000 | 0.14 USD | 2084s, 1465s, 2170s | |
-| 75,000 | 2.39 USD | 8 hours | | |
-
-### Benchmarks (Paid vs Free API Speed Comparison)
-
-Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the relative time required for a free API to translate a single batch (100 entries). If you have additional benchmark data, contributions are welcome.
-
-| API Source | Nvidia (DS v4 flash) | Opencode (DS v4 flash) | Openrouter (gpt-oss-120b) |
-|----------|:-------------------:|:--------------------:|:------------------------:|
-| Relative Time |       1-1.5x        |        1-1.5x        |         1.5-2x           |
-
-> 💡 **Usage tip**: Free APIs are considerably slower and are only recommended as a supplement to paid APIs for large-scale translations (e.g., 2,000+ entries). Since the multi-API round-robin dispatcher automatically distributes tasks to all available APIs, using free APIs for small batches (e.g., 500 entries) may proportionally slow down overall progress.
-
-### Time-of-Day Impact & Fluctuation (Speculative)
-
-- **Daytime is ~20% slower than late night**: OpenRouter's aggregation platform has more users during overlapping Asia/Europe hours, significantly increasing API endpoint response times. Large-scale translation is recommended during off-peak late-night hours.
-- **Same-batch fluctuation of ~±30%**: Each request on OpenRouter may be routed to a different upstream provider or GPU node, combined with varying sentence lengths within batches and different retry counts, resulting in random time variance for the same translation volume.
+| 5,000 | 0.14 USD | 2084s, 1465s, 2170s | — | — |
+| 75,000 | 2.39 USD | 8 hours | — | — |
 
 ---
 
@@ -341,6 +346,12 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 **Q: Translation speed is much slower than expected**
 <br>A: First check the time of day — daytime being ~20% slower than late night is normal. If it's still slow at night, check your network connection or try switching API endpoints.
 
+**Q: The terminal keeps printing "429, cooling down for 60 seconds"**
+<br>A: That is expected behaviour: every 429 restarts a 60-second cooldown for that API, and its jobs are requeued and picked up by the other APIs in the meantime. The API is permanently disabled only after reaching the threshold (2 by default; relaxed automatically to 5 when only one usable API remains). If it happens often, lower the concurrency or add another API key.
+
+**Q: "All APIs permanently disabled" appears**
+<br>A: Every configured API reached the cumulative 429 threshold. Already-translated progress is kept; check your API keys/quota and re-run to resume.
+
 ### Terminology Related
 
 **Q: The review report has many terminology issues I don't recognize**
@@ -349,8 +360,11 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 **Q: I added a term but the AI didn't use it**
 <br>A: Check that the `translation` column in your glossary Excel is non-empty (only rows with a non-empty translation column are loaded). For `ADD_LIST` entries, verify spelling and capitalization are exactly correct.
 
-**Q: "Eggs" is in IGNORE_LIST but still shows up as an issue**
-<br>A: Make sure your `glossary.py` is the latest version — `IGNORE_LIST` now uses normalized matching (adding `Egg` automatically filters `Eggs`, `EGGS`, etc.). If you also have an `"Eggs"` entry in the Excel glossary, remove it from Excel as well.
+**Q: I added `Egg`, but `Eggs` is still flagged**
+<br>A: Make sure your `glossary.py` is the latest version — `IGNORE_LIST` now uses normalized matching (adding `Egg` automatically filters `Eggs`, `EGGS`, etc.). Entries with the same name in the Excel glossary are filtered out at load time too, so there is no need to remove them by hand.
+
+**Q: Why does the term `White wolf` match "white wolves"?**
+<br>A: Term matching supports rule-based plural forms (including irregular and unchanged plurals), so `wolf`/`wolves`, `person`/`people` and `mouse`/`mice` all match. Word boundaries are also required (`Black 2h sword` no longer matches "...swordsman", `Attack mix(2)` no longer matches "superattack mix(2)"). The single-word plural fallback and the last word of multi-word terms share one rule set.
 
 ### File Related
 
@@ -391,7 +405,7 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 ### Proofreading Related
 
 **Q: The message `[APIx] ⚠️ Completion rate 40% (4/10) below 75%, retrying` appears**
-<br>A: The 75% completion rate check is a normal mechanism in the proofreading phase. It automatically retries up to 3 attempts. If still below 75% after 3 tries, it accepts the result and logs debug info.
+<br>A: The 75% completion rate check is a normal mechanism in the proofreading phase. It automatically retries up to 3 attempts. If still below 75% after 3 tries, it accepts the result (debug info is only written when all three attempts fail outright).
 
 **Q: What are Type1 and Type2 in the proofreading report?**
 <br>A: Type1 refers to terminology/placeholder/untranslated issues that can be automatically detected by scripts, marked with background colors. Type2 refers to fluency issues found by LLM dual-round evaluation — only (acceptable, acceptable), (acceptable, mild) and (mild, acceptable) are skipped; mild + mild is still sent for polishing.
@@ -401,6 +415,9 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 
 **Q: What is the difference between Quick and Full proofreading?**
 <br>A: Quick proofreading only performs retranslation fixes (terminology/placeholder/untranslated/spacing) and skips P2 fluency evaluation and P3 polishing, so it is faster; outputs are `_quick_proofread_output.xlsx` and `quick_proofread_report.xlsx`.
+
+**Q: After resuming, some cells became empty and were translated again**
+<br>A: Missing-value markers such as `nan` / `nat` / `none` in checkpoints or backups are no longer restored as translations (earlier versions could write them back into the sheet, even overwriting an existing translation and carrying them into the output). Those rows are treated as untranslated and any later run will translate them again (choosing "No" only clears the checkpoint — it does not avoid the retranslation); if you want to keep the original text, fill the cell back in manually before running.
 
 ---
 

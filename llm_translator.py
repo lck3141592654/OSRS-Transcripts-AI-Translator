@@ -3,28 +3,78 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from dotenv import load_dotenv
-from glossary import find_term_spans, build_relevance_context
-from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
+from glossary import find_term_spans, build_relevance_context, MISSING_SENTINELS
+from api_config import (
+    API_TIMEOUT, OVER_RETURN_TOLERANCE,
+    is_rate_limit_error, is_rate_limit_payload, RateLimitPayloadError,
+)
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 BATCH_SIZE_LIMIT = 100
 
-def _json_safe(value):
-    """把 NaN 等 pandas 空值轉成 None，避免在提示詞中產生無效 JSON。"""
-    if value is None:
-        return None
+def _is_na(value) -> bool:
+    """判斷「值本身是不是 NA 純量」：None／pd.NA／NaN／NaT。
+
+    這裡只回答「這個值是 NA 嗎」，**不做**空字串與哨兵字串
+    （"nan"／"nat"／"none"）判定——序列化時空字串與 "nan" 都是合法 JSON 值。
+
+    與 `is_missing_translation` 的 NA 部分同口徑（該函式現在呼叫這裡），
+    因此 pd.NA／pd.NaT 這類非 float 的缺值不會再被漏掉。
+    對非純量（list／ndarray／Series）`pd.isna` 會回傳陣列，`bool()` 可能
+    丟出 ValueError，故以 try/except 包住並回傳 False（不可拋錯）。
+    ArithmeticError 是為了 Decimal('sNaN')（pd.isna 會拋 decimal.InvalidOperation）。
+    """
+    if value is None or value is pd.NA:
+        return True
     try:
-        if isinstance(value, float) and pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
+        return bool(pd.isna(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+
+
+def _json_safe(value):
+    """把 pandas 空值（含 pd.NA／NaT）轉成 None，避免在提示詞中產生無效 JSON。
+
+    只有真正的 NA 純量轉 None；字串 "nan"、空字串、0 都是合法 JSON 值，
+    必須維持原值（舊寫法只認 float NaN，pd.NA／NaT 會原樣回傳，
+    `json.dumps` 直接拋 TypeError）。
+    """
+    if _is_na(value):
+        return None
     return value
 
 
 CHECKPOINT_SUBDIR = "_checkpoint"
 PROGRESS_FILE = "progress.json"
 SESSION_FILE = "session.json"
+# 固定工作目錄名稱：除錯訊息等一律寫到程式所在目錄下的這個資料夾
+WORKPLACE_DIR_NAME = "workplace"
+DEBUG_MESSAGE_SUBDIR = "_debugmessage"
+
+
+def get_workplace_dir() -> Path:
+    """回傳固定工作目錄（程式所在目錄 / workplace），必要時建立。"""
+    wp = Path(__file__).parent / WORKPLACE_DIR_NAME
+    wp.mkdir(parents=True, exist_ok=True)
+    return wp
+
+
+def get_debug_message_dir(create: bool = True) -> Path:
+    """回傳低翻譯率除錯訊息目錄（工作目錄 / _debugmessage）。
+
+    先前 proofreader.py 與 llm_translator.py 各自寫死同一組路徑常數，
+    與 batch_translate.py／batch_proofread.py 的 _get_workplace() 重複；
+    統一由這裡提供，日後改動工作目錄名稱只需要改一個地方。
+
+    create=False 時只回傳路徑、不建立目錄：顯示與清理上次 debug 訊息的
+    呼叫端要靠 ``exists()`` 判斷有沒有東西要清，若順手建了空目錄，
+    就會永遠印出「已清除 debug 訊息」。
+    """
+    d = get_workplace_dir() / DEBUG_MESSAGE_SUBDIR
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _timestamp(msg: str):
@@ -79,18 +129,56 @@ def get_relevant_glossary(batch, glossary):
 def is_missing_translation(value, english: str | None = None) -> bool:
     """Determine whether a translation cell should be treated as missing.
     String "nan"/"nat"/"none" counts as missing unless the source text is exactly that word.
+
+    任何 `pd.isna` 為 True 的純量（float NaN、np.float64 NaN、NaT、
+    pd.NA／pd.NaT）都算缺值；`pd.NA` 的 `str()` 是 "<NA>"，
+    既不是空字串也不在 ("nan","nat","none") 內，舊寫法會把它當成「已有譯文」。
+    對非純量（list／ndarray／Series）`pd.isna` 會回傳陣列，
+    `bool()` 可能丟出 ValueError，故以 try/except 包住並維持原本行為。
+    ArithmeticError 是為了 Decimal('sNaN')（pd.isna 會拋 decimal.InvalidOperation）；
+    pd.read_excel 不會產生 Decimal，屬防禦性涵蓋，讓這個判定對所有純量都不會拋錯。
+
+    NA 純量的判定集中在本檔的 `_is_na()`：兩者語意不同（這裡還包含空字串與
+    哨兵字串），但 NA 部分必須完全一致，改這裡等於同時改動兩者。
+    哨兵字串集合來自 `glossary.MISSING_SENTINELS`（單一來源），
+    避免 glossary 與本檔各有一份清單而走鐘。
     """
-    if value is None:
-        return True
-    if isinstance(value, float) and pd.isna(value):
+    if _is_na(value):
         return True
     s = str(value).strip()
     if not s:
         return True
-    if s.lower() in ("nan", "nat", "none"):
-        if english is None or str(english).strip().lower() not in ("nan", "nat", "none"):
+    if s.lower() in MISSING_SENTINELS:
+        if english is None or str(english).strip().lower() not in MISSING_SENTINELS:
             return True
     return False
+
+
+def _english_hint(english) -> str | None:
+    """把該列原文轉成可傳給 `is_missing_translation(english=)` 的提示值。
+
+    只有在原文本身是非空字串時才有意義；缺值（NaN／None）或非字串時回傳 None，
+    避免把 "nan" 這種由 NaN 轉出來的字串誤當成「原文真的是 nan」。
+    """
+    if isinstance(english, str) and english.strip():
+        return english
+    return None
+
+
+def _english_hint_at(df, idx) -> str | None:
+    """安全地取某列的原文提示值（`_english_hint(df.at[idx, "english"])` 的防護版）。
+
+    沒有 english 欄、索引不存在、或索引重複（`df.at` 會回 Series）時一律回 None，
+    呼叫端就不必各自寫一次欄位／索引檢查——先前 enforcer 的 scan_issues 是把英文欄
+    先 str() 再往下傳，NaN 因此變成字串 "nan"，讓哨兵譯文被錯誤豁免（P1 與 P4 對
+    同一列判定相反）。所有需要原文提示的地方都應該走這個函式。
+    """
+    try:
+        if "english" in df.columns and idx in df.index:
+            return _english_hint(df.at[idx, "english"])
+    except (TypeError, ValueError, KeyError):
+        pass
+    return None
 
 
 def _sanitize_sheet_name(name: str) -> str:
@@ -146,13 +234,31 @@ def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: d
     atomic_write_text(cd / f"part_{session_tag}_{batch_num:06d}.json", json.dumps(batch_data, ensure_ascii=False))
 
 
+def _part_sort_key(p: Path) -> tuple:
+    """part 檔排序鍵：以寫入時間（mtime_ns）為主，檔名為平手順序。
+
+    stat 失敗（檔案剛好被移除等罕見競態）時退回 (0, 檔名)，不會讓合併崩潰。
+    """
+    try:
+        return (p.stat().st_mtime_ns, p.name)
+    except OSError:
+        return (0, p.name)
+
+
 def load_backup(output_dir=None, sheet_name=None) -> dict:
-    """掃描所有 part_*.json，以 idx 為鍵合併所有備份資料"""
+    """掃描所有 part_*.json，以 idx 為鍵合併所有備份資料。
+
+    合併順序以檔案的寫入時間（mtime）為準，後寫入者覆蓋先寫入者。
+    原本以檔名排序，而 part 檔名內含隨機 tag（UUID），
+    同一 idx 存在於多個 part（LLM 批次值 + enforce 重譯修正值）時，
+    還原值會由 tag 字串排序決定（不確定），續傳可能還原到較舊的值；
+    改為時間序後，較新的修正（如 enforce 重譯結果）必定勝出。
+    """
     cd = _checkpoint_dir(output_dir, sheet_name)
     if not cd.exists():
         return {}
     all_backup: dict = {}
-    for f in sorted(cd.glob("part_*.json")):
+    for f in sorted(cd.glob("part_*.json"), key=_part_sort_key):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             all_backup.update(data)
@@ -163,7 +269,17 @@ def load_backup(output_dir=None, sheet_name=None) -> dict:
 def sync_progress(output_dir=None, sheet_name=None):
     """從 backup part 檔案反推 progress.json，確保絕對同步"""
     backup = load_backup(output_dir, sheet_name)
-    indices = sorted(int(k) for k in backup)
+    # 備份檔損壞或人為編輯時 key 可能不是數字：單一壞 key 不可讓整批同步失敗
+    indices = []
+    skipped = 0
+    for k in backup:
+        try:
+            indices.append(int(k))
+        except (TypeError, ValueError):
+            skipped += 1
+    if skipped:
+        print(f"  警告：進度同步略過 {skipped} 個非數字 key（備份檔損壞或人為編輯）")
+    indices.sort()
     if indices:
         save_progress(output_dir, indices, sheet_name)
     else:
@@ -214,6 +330,10 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\n```$", "", text)
             results = json.loads(text)
+            # 有些供應商 HTTP 200 但 body 是限流錯誤物件；必須當成 429 往上拋，
+            # 否則會一直被當成「格式錯誤」重試，永遠打被限流的端點
+            if is_rate_limit_payload(results):
+                raise RateLimitPayloadError(f"429 rate limit in response payload: {text[:200]}")
 
             # 方法一：先試明確的 key 名稱
             if isinstance(results, dict):
@@ -269,8 +389,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                 success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
                 rate = min(success, len(batch)) / len(batch) if len(batch) > 0 else 0
                 if rate < 0.25:
-                    debug_dir = Path(__file__).parent / "workplace" / "_debugmessage"
-                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    debug_dir = get_debug_message_dir()
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     uid = uuid.uuid4().hex[:4]
                     (debug_dir / f"debug_{ts}_{uid}.json").write_text(
@@ -296,13 +415,15 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                 if "translations" not in results and "index" not in results:
                     print(f"    [{api_id}] 警告：JSON 物件結構異常（無 translations 也無 index）")
                     print(f"    回傳內容前 200 字: {text[:200]}")
-            # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
-            if isinstance(results, dict):
-                results = [results]
+            # 結構無法識別（非 JSON 陣列）視為失敗重試（與其他 LLM 路徑的
+            # 「空回傳視為失敗」政策一致），避免把 0 進度當成成功批次完成
+            if not isinstance(results, list):
+                print(f"    [{api_id}] 警告：回傳結構無法識別（非 JSON 陣列）")
+                print(f"    回傳內容前 200 字: {text[:200]}")
+                raise ValueError("回傳結構無法識別（非 JSON 陣列），視為失敗重試")
             return results
         except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "rate" in error_str:
+            if is_rate_limit_error(e):
                 raise
             # ↓ 嘗試用 json_repair 修復 JSON 格式錯誤
             if isinstance(e, json.JSONDecodeError):
@@ -311,6 +432,9 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                     repaired = repair_json(text)
                     if repaired:
                         results = json.loads(repaired)
+                        if is_rate_limit_payload(results):
+                            raise RateLimitPayloadError(
+                                f"429 rate limit in response payload: {str(results)[:200]}")
                         print(f"    [{api_id}] ⚠️ JSON 修復成功")
                         if isinstance(results, dict) and "translations" in results:
                             results = results["translations"]
@@ -328,6 +452,9 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                             if not results:
                                 raise ValueError("回傳為空或無匹配的 index，視為失敗重試")
                             return results
+                except RateLimitPayloadError:
+                    # 修復後的內容仍是限流錯誤包裝 → 不可被下面吞掉，要往上拋成 429
+                    raise
                 except Exception:
                     pass
             # ↑ 修復結束
@@ -345,18 +472,41 @@ def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None
     backup = load_backup(output_dir, sheet_name)
     if backup:
         restore_count = 0
+        skipped = 0
         for idx_str, trans in backup.items():
-            idx = int(idx_str)
-            if idx in df.index and (pd.isna(df.at[idx, "translation"]) or df.at[idx, "translation"] is None):
+            # 備份檔損壞或人為編輯時 key 可能不是數字 → 只跳過該筆
+            try:
+                idx = int(idx_str)
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            if idx not in df.index:
+                continue
+            # 備份值必須是非空字串才可寫入 translation 欄：
+            # dict／list／數字會被 str() 之後當成譯文（或在 str dtype 欄位上直接拋錯）
+            if not (isinstance(trans, str) and trans.strip()):
+                skipped += 1
+                continue
+            eng_hint = _english_hint(df.at[idx, "english"] if "english" in df.columns else None)
+            # 備份值本身若是缺值標記（字串 "nan"/"nat"/"none"），不可還原成真值；
+            # 但原文真的是那個字時（english= 提示）同值譯文合法
+            if is_missing_translation(trans, english=eng_hint):
+                skipped += 1
+                continue
+            # 與下方 pending 判定同口徑（NaN／None／空字串／"nan" 皆視為缺值）
+            # 只還原缺值，不覆蓋既有譯文
+            if is_missing_translation(df.at[idx, "translation"], english=eng_hint):
                 df.at[idx, "translation"] = trans
                 restore_count += 1
+        if skipped:
+            print(f"  警告：備份中 {skipped} 筆資料無效（非數字 key 或非字串譯文），已略過")
         if restore_count > 0:
             print(f"  從備份還原 {restore_count} 條翻譯")
     if "translation" not in df.columns:
         df["translation"] = None
     pending = []
     for idx, row in df.iterrows():
-        if is_missing_translation(row.get("translation")):
+        if is_missing_translation(row.get("translation"), english=_english_hint(row.get("english"))):
             pending.append({
                 "_idx": idx,
                 "english": str(row["english"]),
@@ -390,24 +540,36 @@ async def translate_sheet_phase(df, glossary, output_dir, pending, sheet_name, p
                 if not isinstance(res, dict):
                     skipped += 1
                     continue
-                idx = res.get("index")
-                trans = res.get("translation")
-                if idx is not None and trans is not None:
+                # 單筆格式異常（index 無法匹配、translation 非字串等）
+                # 只影響該筆，不可讓整個批次的其他結果一起損失
+                try:
+                    idx = res.get("index")
+                    trans = res.get("translation")
+                    # 只有非空字串才可寫入 translation 欄：dict／數字在 str dtype 欄位上
+                    # 會直接拋錯（整批結果一起丟失），list 則會被靜默轉成錯誤的譯文；
+                    # 缺值哨兵（"nan"/"nat"/"none"）也不是譯文，寫進去會與三條還原守門
+                    # 不一致（守門拒絕還原同樣的值），故一律跳過、讓該列維持缺值重試。
+                    if (idx is None or not isinstance(trans, str) or not trans.strip()
+                            or is_missing_translation(trans, english=_english_hint_at(df, idx))):
+                        skipped += 1
+                        continue
                     if idx in batch_indices:
                         df.at[idx, "translation"] = trans
                         new_backup[str(idx)] = str(trans)
                     else:
                         skipped += 1
+                except (TypeError, ValueError) as e:
+                    skipped += 1
+                    print(f"    [{cfg.api_id}] 警告：略過無效回傳（index={res.get('index')!r}）：{e}")
             if skipped:
-                print(f"    [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件或 index 不在工作表中），已忽略")
+                print(f"    [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件、index 不在工作表中或譯文非字串），已忽略")
             if new_backup:
                 save_backup_part(output_dir, session_tag, batch_num, new_backup, sheet_name)
                 sync_progress(output_dir, sheet_name)
             _timestamp(f"[{sheet_name}] 批次 {batch_num}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
         except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "rate" in error_str:
-                cfg.mark_429()
+            if is_rate_limit_error(e):
+                pool.note_429(cfg)
                 if cfg.is_permanently_disabled:
                     print(f"  [{cfg.api_id} {cfg.model}] 第 {cfg.strike} 次 429，永久停用")
                 else:

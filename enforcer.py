@@ -7,13 +7,15 @@ from datetime import datetime
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from glossary import ADD_LIST, find_term_spans, build_relevance_context, filter_relevant_terms, MISSING_SENTINELS
+from glossary import (ADD_LIST, find_term_spans, build_relevance_context,
+                      filter_relevant_terms, MISSING_SENTINELS, TermLookup,
+                      drop_placeholder_spans, placeholder_spans)
 from llm_translator import (
     BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary,
     is_missing_translation, _english_hint, _english_hint_at,
 )
 from api_config import (
-    API_TIMEOUT, OVER_RETURN_TOLERANCE,
+    OVER_RETURN_TOLERANCE,
     is_rate_limit_error, is_rate_limit_payload, RateLimitPayloadError,
 )
 from shared_pool import SharedBatchPool
@@ -46,9 +48,21 @@ def _find_matched_spans(eng_lower: str, glossary: dict, ctx=None) -> list:
     return matches
 
 
-def build_retry_glossary_text(glossary: dict, batch: list) -> str:
+def _join_all_english(df) -> str:
+    """把整張工作表的英文原文串成一段小寫文本。
+
+    必須用 map(str) 而不是 fillna("")：原本的 str(row.get("english","")) 會把
+    NaN 變成字面 "nan"，用 fillna 會讓文本少 3 個字元、與舊行為不等價。
+    也不可用 astype(str)：pandas 3.0 對缺值是 no-op，join 時會直接 TypeError。
+    """
+    if "english" not in df.columns:
+        return " ".join([""] * len(df)).lower()
+    return " ".join(df["english"].map(str).str.lower().tolist())
+
+
+def build_retry_glossary_text(glossary: dict, batch: list, lookup=None) -> str:
     """只把當前重譯批次實際出現的術語做成提示詞文字，避免整張工作表術語造成超 token。"""
-    relevant = get_relevant_glossary(batch, glossary)
+    relevant = get_relevant_glossary(batch, glossary, lookup)
     if not relevant:
         return "  无"
     return "\n".join([f"  {e} → {c}" for e, c in relevant])
@@ -60,15 +74,21 @@ def check_glossary_usage(english_text: str, translated_text: str, glossary: dict
     當原文中長術語（如 "Lord Hosidius"）的翻譯已正確出現在譯文中，
     則其範圍內的短術語（如 "Hosidius"）不再重複檢查。
     ctx：可選的預建匹配上下文（build_relevance_context），由 scan_issues 每行建立一次。
+    [...] 佔位符內的英文不參與術語比對：佔位符內容必須逐字保留，術語只出現在
+    佔位符裡時（例如 [Fremennik name]）不算命中，也不要求譯文出現中文譯名。
     """
     issues = []
     eng_lower = english_text.lower()
     trans_lower = translated_text.lower()
+    ph_spans = placeholder_spans(eng_lower)
 
     matches = _find_matched_spans(eng_lower, glossary, ctx)
 
     covered_by_correct = []  # 已被正確翻譯的長術語所覆蓋的 span 集合
     for eng, chn, spans in matches:
+        spans = drop_placeholder_spans(spans, eng_lower, ph_spans)
+        if not spans:
+            continue
         # 檢查此術語的所有匹配 span 是否都被已覆蓋
         all_covered = all(
             any(s >= cs[0] and e <= cs[1] for cs in covered_by_correct)
@@ -230,69 +250,75 @@ def preprocess_issues(df, pool):
 def narrow_relevant_glossary(df, glossary) -> dict:
     """把 filter_relevant_terms 的安全上界收斂成「真的會在某列命中」的術語集合。
 
-    上界的好處是快（O(術語數)，不做逐術語全文掃描），代價是詞庫偏大，
-    而逐列精確比對的成本與詞庫大小成正比；一次 enforce 會跑許多次
-    scan_issues（每輪前後各一次，最多三輪，外加最終掃描），所以先用一次
-    逐列掃描把沒命中的術語去掉，之後每一輪都回到精確成本。
+    原本對每一列掃過整個上界詞庫、逐條呼叫 find_term_spans，成本是
+    O(列數 × 上界術語數)（實測 0.67 µs/（列 × 術語），10 萬列級要 10 分鐘以上）。
+    改用 TermLookup 的候選索引先取候選，成本降到
+    O(列數 × (文本詞數 + 文本 3-gram 數) + 命中數)。
 
     為什麼收斂不會漏：英文原文在整個 enforce 期間不會改變，因此「哪些術語
     會命中某一列」是固定的；這裡只依英文原文判斷（不看譯文），所以尚未翻譯
     的列也一併納入，後續輪次才被翻譯的列不會失去它的術語。
     """
+    if not glossary:
+        return {}
+    lookup = TermLookup(glossary)
     matched: set = set()
-    for _idx, row in df.iterrows():
-        eng = str(row.get("english", ""))
+    # 用 .map(str) 而不是 astype(str)：pandas 3.0 的 astype(str) 對 NA 是 no-op（見全域限制 12）
+    english = (df["english"].map(str).tolist()
+               if "english" in df.columns else [""] * len(df))
+    for eng in english:
         if not eng:
             continue
         eng_lower = eng.lower()
         ctx = build_relevance_context(eng_lower)
-        for e, _chn, _spans in _find_matched_spans(eng_lower, glossary, ctx):
+        for e, _chn, _spans in _find_matched_spans(
+                eng_lower, lookup.candidates(eng_lower, ctx), ctx):
             matched.add(e)
     if not matched:
         return {}
     # 保留 glossary 的原始順序（下游 get_relevant_glossary 依賴相對順序穩定）
     return {e: c for e, c in glossary.items() if e in matched}
 
+def scan_issues(df, relevant_glossary, lookup=None) -> list[tuple]:
+    """走訪所有行，彙整三種檢查的結果，回傳問題 pool。
 
-def scan_issues(df, relevant_glossary) -> list[tuple]:
-    """走訪所有行，彙整三種檢查的結果，回傳問題 pool"""
+    lookup：可選的 TermLookup；由呼叫端建立一次共用（一次 enforce 最多會呼叫
+    這個函式 10 次，全詞庫重建索引要 0.125 秒，絕不可每輪重建）。
+
+    這裡刻意保留 df.iterrows()：改動後的成本由「術語比對」變成「逐列迭代」，
+    而 iterrows 在 10 萬列上約 1.9 秒、相對於省下的數分鐘可以接受；
+    保留 (idx, row, issues) 的 tuple 契約可以讓下游三個消費者不必改動。
+    """
     keep_original_terms = {k.strip().lower() for k, v in ADD_LIST.items() if v.strip().lower() == str(k).strip().lower()}
+    if lookup is None:
+        lookup = TermLookup(relevant_glossary)
     pool = []
     for idx, row in df.iterrows():
         eng = row.get("english")
         trans = row.get("translation")
         all_issues = []
 
-        # 未翻譯檢查（包含空值情況）
-        # 傳原值而非 str(...)：英文欄空白時 str() 會變字串 "nan"，
-        # 讓 check_untranslated 的原文豁免錯誤放行哨兵譯文（見 _english_hint_at 說明）
         untrans_issues = check_untranslated(eng, trans, keep_original_terms=keep_original_terms)
         if untrans_issues:
             for ui in untrans_issues:
                 all_issues.append(("untranslated", "", ui))
             pool.append((idx, row, all_issues))
-            continue  # 未翻譯時不繼續做其他檢查
+            continue
 
-        # 術語檢查（已有譯文才做）
         eng_term = str(eng)
         trans_str = str(trans)
-        # 每行只建立一次匹配上下文，供該行所有術語共用（避免每術語重建，大表掃描 10x 加速）
-        ctx = build_relevance_context(eng_term.lower())
-        glossary_issues = check_glossary_usage(eng_term, trans_str, relevant_glossary, ctx)
-        # 注意迴圈變數不可命名為 eng_term：那會覆蓋上面的英文原文，
-        # 使下一段的 check_placeholder() 拿到術語字串而非原文，該行佔位符問題被靜默吞掉
-        for g_eng, g_chn, g_desc in glossary_issues:
+        eng_lower = eng_term.lower()
+        ctx = build_relevance_context(eng_lower)
+        # 只對候選做精確比對（候選保留 glossary 原順序，因此 _find_matched_spans
+        # 的長度降序穩定排序結果與舊版逐條掃描相同）
+        candidates = lookup.candidates(eng_lower, ctx)
+        for g_eng, g_chn, g_desc in check_glossary_usage(eng_term, trans_str, candidates, ctx):
             all_issues.append(("glossary", f"{g_eng} → {g_chn}", g_desc))
 
-        # 佔位符檢查
-        ph_issues = check_placeholder(eng_term, trans_str)
-        if ph_issues:
-            for pi in ph_issues:
-                all_issues.append(("placeholder", "", pi))
+        for pi in check_placeholder(eng_term, trans_str):
+            all_issues.append(("placeholder", "", pi))
 
-        # 空格檢查
-        space_issues = check_space_issues(trans_str)
-        for _, _, desc in space_issues:
+        for _t, _f, desc in check_space_issues(trans_str):
             all_issues.append(("space", "", desc))
 
         if all_issues:
@@ -351,14 +377,14 @@ def _extract_retry_results(parsed, batch):
     return list(mapped.values())
 
 
-async def _retry_round(client, model_name, pool, glossary, rnd):
+async def _retry_round(client, model_name, pool, glossary, rnd, lookup=None):
     """非同步執行一輪重譯，返回修正後的條目數"""
     # 每批 BATCH_SIZE_LIMIT（100）條，無群組機制
     all_results = []
     for bs in range(0, len(pool), BATCH_SIZE_LIMIT):
         batch = pool[bs:bs + BATCH_SIZE_LIMIT]
         items = [{"index": idx, "english": str(row["english"])} for idx, row, _ in batch]
-        glossary_text = build_retry_glossary_text(glossary, items)
+        glossary_text = build_retry_glossary_text(glossary, items, lookup)
         prompt = (RETRY_PROMPTS[rnd] + "\n" + json.dumps(items, ensure_ascii=False)
                   + f"\n## 强制术语表（请严格使用以下翻译）\n{glossary_text}"
                   + "\n请回传 JSON 阵列，每条包含 index 和 translation。")
@@ -368,7 +394,7 @@ async def _retry_round(client, model_name, pool, glossary, rnd):
                 resp = await client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0, timeout=API_TIMEOUT,
+                    temperature=0,
                 )
                 # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
                 content = resp.choices[0].message.content.strip()
@@ -434,6 +460,9 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
         print("  無可用 API，跳過重譯")
         return df
 
+    # TL4 索引：本函式共用（scan_issues 與重譯提示詞都吃同一份）
+    lookup = TermLookup(relevant_glossary)
+
     # ── 檢查 enforce checkpoint ──
     start_round = 0
     enforce_tag = uuid.uuid4().hex[:8]
@@ -451,7 +480,7 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
                 pass
 
     for rnd in range(start_round, 3):
-        pool = scan_issues(df, relevant_glossary)
+        pool = scan_issues(df, relevant_glossary, lookup)
 
 
         # ★ 腳本預處理（每輪重譯前都執行）
@@ -474,7 +503,7 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
                 print(f"  ⚡ 腳本預處理前問題：{'、'.join(before_parts)}")
 
             preprocess_issues(df, pool)
-            pool = scan_issues(df, relevant_glossary)
+            pool = scan_issues(df, relevant_glossary, lookup)
 
             # 統計修正了哪些類型
             space_after = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "space")
@@ -525,7 +554,8 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
             cfg = ws["cfg"]
             batch_slice = job.batch
             try:
-                results = await _retry_round(ws["client"], cfg.model, batch_slice, relevant_glossary, rnd)
+                results = await _retry_round(ws["client"], cfg.model, batch_slice,
+                                             relevant_glossary, rnd, lookup=lookup)
                 batch_indices = {item[0] for item in batch_slice}
                 fixed = 0
                 skipped = 0
@@ -571,7 +601,7 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
             await asyncio.gather(*[shared_pool.submit(bn, b, _retry_process) for bn, b in enumerate(batches, 1)])
 
         # 計算修正率，決定是否繼續
-        post_pool = scan_issues(df, relevant_glossary)
+        post_pool = scan_issues(df, relevant_glossary, lookup)
 
         # ★ 儲存本輪修正到 part 檔案（原子寫入） ★
         if output_dir:
@@ -630,7 +660,7 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
     # 用安全上界過濾（詞集合／子字串），不做逐術語全文掃描：
     # 原本對整張工作表的 all_text（實際最大 7 MB）逐條跑 find_term_spans，
     # 每條都要掃全文，整張表是小時級成本（見 filter_relevant_terms 的說明）。
-    all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
+    all_text = _join_all_english(df)
     _ctx = build_relevance_context(all_text)
     relevant_glossary = filter_relevant_terms(glossary, all_text, _ctx)
     # 上界只是「不會漏」；用一次逐列掃描收斂成真正命中的集合，
@@ -653,7 +683,8 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
                 await tmp_pool.close()
 
     # 最終審查掃描
-    final_pool = scan_issues(df, relevant_glossary)
+    lookup = TermLookup(relevant_glossary)
+    final_pool = scan_issues(df, relevant_glossary, lookup)
     for idx, row, issues in final_pool:
         trans = row.get("translation")
         # 審查報告的「目前譯文」不可出現 "<NA>"／"nan" 這類缺值字面值

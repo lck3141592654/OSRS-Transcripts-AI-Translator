@@ -9,19 +9,20 @@ from copy import deepcopy
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
-from glossary import load_glossary, auto_extract_glossary, find_term_spans, build_relevance_context, filter_relevant_terms
+from glossary import (load_glossary, auto_extract_glossary, find_term_spans,
+                      build_relevance_context, filter_relevant_terms, TermLookup)
 from tm_matcher import match_and_fill
 from llm_translator import (
     _group_into_batches, _sanitize_sheet_name,
-    save_backup_part, sync_progress, atomic_write_text,
+    save_backup_part, sync_progress, save_progress, atomic_write_text,
     get_relevant_glossary, is_missing_translation, get_debug_message_dir,
-    _english_hint, _english_hint_at,
+    _english_hint, _english_hint_at, _progress_indices, load_backup,
 )
 from enforcer import (
-    scan_issues, _enforce_async, narrow_relevant_glossary,
+    scan_issues, _enforce_async, narrow_relevant_glossary, _join_all_english,
 )
 from api_config import (
-    API_TIMEOUT, OVER_RETURN_TOLERANCE,
+    OVER_RETURN_TOLERANCE,
     is_rate_limit_error, is_rate_limit_payload, RateLimitPayloadError,
 )
 from shared_pool import SharedBatchPool
@@ -161,8 +162,8 @@ def _pad_eval_results(results, batch):
     return padded
 
 
-async def _evaluate_batch(client, model, batch, glossary, api_id):
-    relevant = get_relevant_glossary(batch, glossary)
+async def _evaluate_batch(client, model, batch, glossary, api_id, lookup=None):
+    relevant = get_relevant_glossary(batch, glossary, lookup)
     glossary_str = "\n".join([f"  {e} → {c}" for e, c in relevant]) if relevant else "  无"
     system_prompt = SYSTEM_PROMPT_EVAL.replace("{RELEVANT_GLOSSARY}", glossary_str)
     user_content = json.dumps([
@@ -181,7 +182,6 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                 ],
 
                 temperature=0.1,
-                timeout=API_TIMEOUT,
             )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
@@ -470,18 +470,20 @@ def _plan_phase2_tasks(batches, resume_progress, output_dir, sheet_name):
 
 async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=None, resume_progress=None):
     pending = []
-    for idx, row in df.iterrows():
-        trans = row.get("translation")
-        # 與 P1／P4 同口徑：None／NaN／NaT／pd.NA／空字串／哨兵字串都不是可用譯文，
-        # 原文本身真的是 "nan"/"nat"/"none" 時（english= 提示）才算合法譯文
-        if is_missing_translation(trans, english=_english_hint(row.get("english"))):
+    eng_vals = df["english"].map(str).tolist() if "english" in df.columns else [""] * len(df)
+    english_raw = df["english"].tolist() if "english" in df.columns else [None] * len(df)
+    sub_vals = (df["sub_category"].map(str).tolist() if "sub_category" in df.columns
+                else [""] * len(df))
+    trans_vals = df["translation"].tolist() if "translation" in df.columns else [None] * len(df)
+    for idx, eng_raw, eng_val, sub_val, trans_val in zip(
+            df.index, english_raw, eng_vals, sub_vals, trans_vals):
+        if is_missing_translation(trans_val, english=_english_hint(eng_raw)):
             continue
-        ts = str(trans).strip()
         pending.append({
             "_idx": idx,
-            "english": str(row.get("english", "")),
-            "translation": ts,
-            "sub_category": str(row.get("sub_category", "")),
+            "english": eng_val,
+            "translation": str(trans_val).strip(),
+            "sub_category": sub_val,
         })
     if not pending:
         return df, []
@@ -495,12 +497,15 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
     total_batches = len(batches)
     tag, rr1, rr2, all_tasks = _plan_phase2_tasks(batches, resume_progress, output_dir, sheet_name)
 
+    lookup = TermLookup(glossary)          # P2 每個階段只建一次（0.125 秒）
+
     async def process_batch(ws, job):
         orig_bn, rnd, batch = job.ctx
         cfg = ws["cfg"]
         _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 開始 ({len(batch)} 條) [{cfg.api_id} {cfg.model}]")
         try:
-            results = await _evaluate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
+            results = await _evaluate_batch(ws["client"], cfg.model, batch, glossary,
+                                            cfg.api_id, lookup=lookup)
             results = results[:len(batch)]
             # 正規化後的等級一律是非空字串（壞值→「严重」），計數與 skip_pairs 才一致
             normalized = []
@@ -611,8 +616,8 @@ SYSTEM_PROMPT_POLISH = (
 )
 
 
-async def _polish_batch(client, model, batch, glossary, api_id):
-    relevant = get_relevant_glossary(batch, glossary)
+async def _polish_batch(client, model, batch, glossary, api_id, lookup=None):
+    relevant = get_relevant_glossary(batch, glossary, lookup)
     glossary_str = "\n".join([f"  {e} \u2192 {c}" for e, c in relevant]) if relevant else "  \u65e0"
     system_prompt = SYSTEM_PROMPT_POLISH.replace("{RELEVANT_GLOSSARY}", glossary_str)
     user_content = json.dumps([
@@ -630,7 +635,6 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                 ],
 
                 temperature=0.1,
-                timeout=API_TIMEOUT,
             )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
@@ -903,6 +907,8 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
         return df
 
     MAX_ROUNDS = 3
+    lookup = TermLookup(glossary)          # P3 每個階段只建一次（0.125 秒）
+    completed_indices = _progress_indices(load_backup(output_dir, sheet_name))
     current_indices = sorted(all_indices)
     # 續傳：只保留「譯文仍為空」或「上一輪失敗」的條目，已潤色完成的不重送
     if start_round > 0:
@@ -935,7 +941,8 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
             bn, batch = job.batch_num, job.batch
             _timestamp(f"P3 批次 {bn}/{total_batches} 开始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
             try:
-                results = await _polish_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
+                results = await _polish_batch(ws["client"], cfg.model, batch, glossary,
+                                              cfg.api_id, lookup=lookup)
                 new_backup = {}
                 skipped = 0
                 for res in results:
@@ -964,8 +971,15 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
                 if skipped:
                     print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件、index 不在工作表中或譯文非字串），已忽略")
                 if new_backup:
+                    # ⚠️ P3 的變數名是 tag / bn，不是 llm_translator 版的 session_tag / batch_num。
+                    # 直接照抄上面 (a) 的程式碼會在 save_backup_part 就直接 NameError。
                     save_backup_part(output_dir, tag, bn, new_backup, sheet_name)
-                    sync_progress(output_dir, sheet_name)
+                    for k in new_backup:
+                        try:
+                            completed_indices.append(int(k))
+                        except (TypeError, ValueError):
+                            continue
+                    save_progress(output_dir, sorted(set(completed_indices)), sheet_name)
                 _timestamp(f"P3 批次 {bn}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
             except Exception as e:
                 if is_rate_limit_error(e):
@@ -1060,7 +1074,7 @@ def _save_debug_info(api_id, model, batch_size, returned, success, text):
 async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     import pandas as pd
     # Compute relevant glossary (same logic as enforcer.enforce())
-    all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
+    all_text = _join_all_english(df)
     _ctx = build_relevance_context(all_text)
     relevant_glossary = filter_relevant_terms(glossary, all_text, _ctx)
     # 上界只是「不會漏」；收斂成真正命中的集合，讓後續掃描回到精確成本
@@ -1069,7 +1083,8 @@ async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     if pool is not None:
         df = await _enforce_async(df, relevant_glossary, output_dir=output_dir, sheet_name=sheet_name, shared_pool=pool)
     # Final scan (same as enforcer.enforce())
-    final_pool = scan_issues(df, relevant_glossary)
+    lookup = TermLookup(relevant_glossary)
+    final_pool = scan_issues(df, relevant_glossary, lookup)
     review_rows = []
     for idx, row, issues in final_pool:
         trans = row.get("translation")
@@ -1257,8 +1272,7 @@ def _build_session_data(excel_path, glossary_path, glossary_sheets, current_shee
         # 與 batch_translate 一致：存完整內容（dict 清單），而非只存數量
         rows = []
         for df in accumulated_review_rows:
-            for _, r in df.iterrows():
-                rows.append(r.to_dict())
+            rows.extend(df.to_dict(orient="records"))
         session["accumulated_review_rows"] = rows
     return session
 

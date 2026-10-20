@@ -45,16 +45,34 @@ def filter_template_filled(pending, df):
     return [p for p in pending if p["_idx"] not in filled]
 
 
-def validate_columns(excel_path, sheet_names, required=("english", "translation")) -> bool:
-    """檢查目標工作表是否具備必要欄位，避免後續 KeyError。"""
+def validate_columns(frames: dict, sheet_names, required=("english", "translation")) -> bool:
+    """檢查目標工作表是否具備必要欄位，避免後續 KeyError。
+
+    frames：已載入的 {工作表: DataFrame}；呼叫端必須先讀好，這裡不再重複讀檔。
+    """
     ok = True
     for sn in sheet_names:
-        df = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
+        df = frames.get(sn)
+        if df is None:
+            print(f"  錯誤：找不到工作表「{sn}」的資料")
+            ok = False
+            continue
         missing = [c for c in required if c not in df.columns]
         if missing:
             print(f"  錯誤：工作表「{sn}」缺少必要欄位: {', '.join(missing)}")
             ok = False
     return ok
+
+
+def get_frame(frames: dict | None, excel_path, sheet_name: str) -> pd.DataFrame:
+    """取得工作表 DataFrame：優先用呼叫端已載入的快取（回傳副本），否則讀檔。
+
+    回傳副本是必要的：呼叫端（_run_translation_pipeline、run_proofread）
+    會用 df.update() 就地改寫，直接回傳快取物件會污染同一張表的其他階段。
+    """
+    if frames is not None and sheet_name in frames:
+        return frames[sheet_name].copy()
+    return pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
 
 
 def list_excel_files(directory: Path) -> list[Path]:
@@ -312,6 +330,41 @@ def _build_session_data(excel_path, glossary_path, glossary_sheets,
         data["accumulated_review_rows"] = rows
     return data
 
+_FILLS = {
+    "[glossary]": "D9D9D9",
+    "[placeholder]": "BDD7EE",
+    "[untranslated]": "F4CCCC",
+    "[space]": "E2EFDA",
+}
+
+
+def write_review_report(path: Path, review_df: pd.DataFrame) -> None:
+    """寫出審查報告並依問題類型上色。
+
+    顏色直接在 ExcelWriter 的 worksheet 上套用，不再 to_excel → load_workbook
+    → 上色 → save 的二次讀寫（5 萬列報告來回約 7 秒）。
+    """
+    from openpyxl.styles import Color, PatternFill
+    fills = {k: PatternFill(start_color=Color(rgb=v), end_color=Color(rgb=v), fill_type="solid")
+             for k, v in _FILLS.items()}
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        review_df.to_excel(writer, index=False, sheet_name="Sheet1")
+        ws = writer.sheets["Sheet1"]
+        issue_col = None
+        for ci, cell in enumerate(ws[1], start=1):
+            if cell.value == "issue":
+                issue_col = ci
+                break
+        if issue_col is None:
+            return
+        for row in ws.iter_rows(min_row=2, max_col=ws.max_column, max_row=ws.max_row):
+            v = str(row[issue_col - 1].value) if row[issue_col - 1].value else ""
+            for prefix, fill in fills.items():
+                if v.startswith(prefix):
+                    for cell in row:
+                        cell.fill = fill
+                    break
+
 def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
                    all_review_rows: list[pd.DataFrame], overall_start: datetime):
     out_path = workplace / f"{excel_path.stem}_translated_output.xlsx"
@@ -328,43 +381,7 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
         combined_review = _dedup_report_rows(
             combined_review, ["sheet_name", "english", "issue"], "review_report")
         report_path = workplace / "review_report.xlsx"
-        combined_review.to_excel(report_path, index=False, sheet_name='Sheet1')
-
-        # ── 補上顏色標記（與 enforcer.py 一致） ──
-        from openpyxl.styles import Color, PatternFill
-        from openpyxl import load_workbook
-
-        wb = load_workbook(report_path)
-        ws = wb['Sheet1']
-
-        issue_col = None
-        for col_idx, cell in enumerate(ws[1], start=1):
-            if cell.value == "issue":
-                issue_col = col_idx
-                break
-
-        if issue_col:
-            fill_glossary = PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid")
-            fill_placeholder = PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid")
-            fill_untranslated = PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid")
-            fill_space = PatternFill(start_color=Color(rgb="E2EFDA"), end_color=Color(rgb="E2EFDA"), fill_type="solid")
-
-            for row in ws.iter_rows(min_row=2, max_col=ws.max_column, max_row=ws.max_row):
-                issue_val = str(row[issue_col - 1].value) if row[issue_col - 1].value else ""
-                if issue_val.startswith("[glossary]"):
-                    fill = fill_glossary
-                elif issue_val.startswith("[placeholder]"):
-                    fill = fill_placeholder
-                elif issue_val.startswith("[untranslated]"):
-                    fill = fill_untranslated
-                elif issue_val.startswith("[space]"):
-                    fill = fill_space
-                else:
-                    continue
-                for cell in row:
-                    cell.fill = fill
-
-        wb.save(report_path)
+        write_review_report(report_path, combined_review)
         print(f"  審查報告已寫入: {report_path} ({len(combined_review)} 條)")
 
     delete_checkpoint_files(str(workplace))
@@ -379,7 +396,7 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
 
 async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_path, glossary_sheets,
                                     sheet_configs, pending_sheets, completed_sheets,
-                                    all_translated_dfs, all_review_rows):
+                                    all_translated_dfs, all_review_rows, frames=None):
     # Phase-barrier parallel translation:
     # Phase A local template match -> Phase B LLM translate (all sheets) -> Phase C enforce (all sheets).
     pool = SharedBatchPool()
@@ -393,7 +410,7 @@ async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_pa
         sheet_states = {}
         for sheet_name in pending_sheets:
             timestamp(f"讀取 {sheet_name}...")
-            df_full = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
+            df_full = get_frame(frames, excel_path, sheet_name)
             print(f"    總條數: {len(df_full)}")
             sheet_cfg = sheet_configs.get(sheet_name, {})
             selected_indices = set(sheet_cfg.get("selected_indices", []))
@@ -595,9 +612,6 @@ async def main():
     workplace = _get_workplace()
     glossary_path, glossary_sheets = step2(exclude_path=excel_path)
     sheet_names = step3(excel_path)
-    if not validate_columns(excel_path, sheet_names):
-        input("\n按 Enter 關閉...")
-        return
 
     overall_start = datetime.now()
     t0 = datetime.now()
@@ -622,6 +636,11 @@ async def main():
         sheet_untranslated.append((sn, uc))
         cached_dfs[sn] = df_temp
 
+    # ← 原本在 :598-600 的驗證搬來這裡，並改吃快取
+    if not validate_columns(cached_dfs, sheet_names):
+        input("\n按 Enter 關閉...")
+        return
+
     # 逐工作表選擇翻譯範圍
     sheet_configs = {}
     for sn, uc in sheet_untranslated:
@@ -634,7 +653,6 @@ async def main():
             "mode": sn_mode,
             "selected_indices": list(df_filtered.index) if len(df_filtered) > 0 else [],
         }
-    del cached_dfs  # 釋放記憶體
 
     # 顯示摘要並確認
     total_selected = sum(len(cfg["selected_indices"]) for cfg in sheet_configs.values())
@@ -662,7 +680,7 @@ async def main():
 
     await _run_translation_pipeline(excel_path, workplace, glossary, glossary_path, glossary_sheets,
                                             sheet_configs, pending_sheets, completed_sheets,
-                                            all_translated_dfs, all_review_rows)
+                                            all_translated_dfs, all_review_rows, frames=cached_dfs)
 
     _write_outputs(excel_path, workplace, all_translated_dfs, all_review_rows, overall_start)
     delete_checkpoint_files(str(workplace))

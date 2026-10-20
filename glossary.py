@@ -14,6 +14,8 @@ _re_exact_cache: dict = {}
 _re_plural_cache: dict = {}
 _re_plain_cache: dict = {}
 _re_word_cache = re.compile(r"[a-z']+")
+# 佔位符 [...]；術語比對要跳過這裡面的英文（見 placeholder_spans）
+_re_placeholder = re.compile(r"\[.*?\]")
 # 所有格字元：'s / ’s / 複數所有格 s'
 _APOS_CHARS = "'\u2019"
 # 詞界判定用的「單字字元」集合（英數字與撇號）；供 _find_multi_word_span 的詞界檢查使用
@@ -55,10 +57,12 @@ ADD_LIST: dict[str, str] = {
     "unranked Tournament": "非排位赛", "Old One": "古老者", "bank pin": "银行pin码", "Lady Lumbridge": "仑桥夫人号",
 }
 
+# ⚠️ 只放「普通名詞」：清單內的詞會在 load_glossary 被永久過濾，永遠不會進入
+# 提示詞或術語檢查。專有名詞（例如 Fremennik）放進來等於讓該術語完全失效。
 IGNORE_LIST: set[str] = {"Toolkit", "Vial", "Bones", "Burnt bones", "Cup of tea", "Message", "Book"
                          , "Translation book", "Twigs", "Knife", "Plank", "Rock", "Chisel"
                          , "Barrel", "Cake", "Watch", "Chart", "Journal"
-                         , "Man", "Fremennik", "Branch", "Manual", "Stool"
+                         , "Man", "Branch", "Manual", "Stool"
                          , "Monkey", "Torso", "Arms", "Legs", "Letter"
                          , "Corpse of woman", "Mud", "Pole", "Rake", "Chores"
                          , "Sand", "Sandy hand", "Roll", "Item", "Dummy"
@@ -269,6 +273,31 @@ def _term_pattern(body: str):
     )
 
 
+def placeholder_spans(text: str) -> list[tuple[int, int]]:
+    """回傳 [...] 佔位符的 span。
+
+    佔位符內容必須逐字保留（llm_translator.SYSTEM_PROMPT_BASE 規則 4），
+    因此術語檢查與術語提示詞都要跳過落在這裡面的英文詞；否則
+    `[Fremennik name]` 會被當成 Fremennik 的實際出現位置，產生譯文永遠
+    改不動的假術語問題（同類案例：`[needles/thread/pieces of wool]`）。
+    """
+    return [m.span() for m in _re_placeholder.finditer(text)]
+
+
+def drop_placeholder_spans(spans, text: str, ph_spans=None) -> list[tuple[int, int]]:
+    """剔除完全落在 [...] 佔位符內的 span，其餘匹配原樣保留。
+
+    ph_spans：可由呼叫端預先算好的 placeholder_spans(text)；同一段文本要
+    過濾多條術語時先算一次，避免每條術語都重跑一次 regex。
+    """
+    if not spans:
+        return []
+    ph = placeholder_spans(text) if ph_spans is None else ph_spans
+    if not ph:
+        return list(spans)
+    return [s for s in spans if not any(s[0] >= a and s[1] <= b for a, b in ph)]
+
+
 def find_term_spans(term: str, text: str, ctx: tuple[set, dict] | None = None) -> list[tuple[int, int]]:
     """回傳術語在文本中出現的 span 清單（詞邊界）。
 
@@ -396,6 +425,119 @@ def _find_multi_word_span(parts: list, text_l: str) -> list[tuple[int, int]]:
             return [(pos, cursor)]
         start = pos + 1
 
+
+def _is_plain_term(term_l: str) -> bool:
+    """術語是否「每個詞都是純 [a-z']+」——與 find_term_spans 的 plain 判定完全相同。
+
+    刻意共用 `_re_plain_cache`：斷詞規則與 find_term_spans / filter_relevant_terms
+    是同一個（`_re_word_cache`），術語分類不會出現第三套規則。
+    """
+    plain = _re_plain_cache.get(term_l)
+    if plain is None:
+        plain = all(_re_word_cache.fullmatch(p) for p in term_l.split())
+        _re_plain_cache[term_l] = plain
+    return plain
+
+
+class TermLookup:
+    """術語候選索引（TL4）：plain 走倒排索引，non-plain 走 3-gram 索引。
+
+    建構成本 O(術語數 × 平均長度)，每次開掃前建一次即可（全詞庫實測 0.125 秒；
+    逐批重建會比舊版逐條掃描更慢，見 Task 7 的共用要求）。
+
+    超集性證明（候選只保證「不會漏」，精確與否仍由 find_term_spans 決定）：
+    - plain 術語：find_term_spans 的詞集合預篩要求「術語的每個詞（或其複數形）
+      都在文本詞集合中」，因此任取術語的一個詞當索引鍵都必然命中；
+    - non-plain 術語：find_term_spans 以 `term_l in text_l` 把關。若術語逐字
+      出現在文本中，術語的任一個 3-gram 也必然出現在文本中（同一位置的子字串），
+      因此以「術語內最稀有的 3-gram」當鍵必然命中；命中後再用 `in` 複驗。
+    """
+
+    __slots__ = ("glossary", "order", "plain_index", "nonplain_index",
+                 "nonplain_short")
+
+    def __init__(self, glossary: dict):
+        self.glossary = glossary
+        self.order = {eng: i for i, eng in enumerate(glossary)}
+
+        plain_terms: dict = {}
+        nonplain_terms: dict = {}
+        for eng in glossary:
+            el = eng.lower().strip()
+            if not el:
+                continue
+            if _is_plain_term(el):
+                plain_terms[eng] = set(_re_word_cache.findall(el))
+            else:
+                nonplain_terms[eng] = el
+
+        # ── plain：挑「詞庫中出現次數最少」的 token 當主要鍵 ──
+        token_freq: dict = {}
+        for toks in plain_terms.values():
+            for t in toks:
+                token_freq[t] = token_freq.get(t, 0) + 1
+        plain_index: dict = {}
+        for eng, toks in plain_terms.items():
+            key = min(toks, key=lambda t: (token_freq.get(t, 0), -len(t), t))
+            for form in _plural_forms(key):
+                plain_index.setdefault(form, []).append(eng)
+        self.plain_index = plain_index
+
+        # ── non-plain：挑「術語集合內出現次數最少」的 3-gram 當主要鍵 ──
+        gram_freq: dict = {}
+        term_grams: dict = {}
+        for eng, el in nonplain_terms.items():
+            if len(el) < 3:                       # 沒有 3-gram → 直接子字串桶
+                term_grams[eng] = None
+                continue
+            grams = {el[i:i + 3] for i in range(len(el) - 2)}
+            term_grams[eng] = grams
+            for g in grams:
+                gram_freq[g] = gram_freq.get(g, 0) + 1
+        nonplain_index: dict = {}
+        nonplain_short: list = []
+        for eng, grams in term_grams.items():
+            if grams is None:
+                nonplain_short.append(eng)
+                continue
+            key = min(grams, key=lambda g: (gram_freq[g], g))
+            nonplain_index.setdefault(key, []).append(eng)
+        self.nonplain_index = nonplain_index
+        self.nonplain_short = nonplain_short
+
+    def candidates(self, text_l: str, ctx=None) -> dict:
+        """回傳「可能是精確命中」的術語子集（保留 glossary 原順序）。
+
+        text_l 必須已轉小寫（與 find_term_spans 的內部約定一致）。
+        ctx 是可選的 build_relevance_context(text_l)；單列與整批文本都直接傳入。
+        """
+        words, _plural_map = ctx if ctx is not None else build_relevance_context(text_l)
+        hits: set = set()
+
+        # plain：文本詞集合 ∩ 倒排索引
+        plain_index = self.plain_index
+        for w in words:
+            lst = plain_index.get(w)
+            if lst:
+                hits.update(lst)
+
+        # non-plain：文本的所有 3-gram ∩ 倒排索引，再用整串子字串複驗
+        nonplain_index = self.nonplain_index
+        if nonplain_index:
+            for i in range(len(text_l) - 2):
+                lst = nonplain_index.get(text_l[i:i + 3])
+                if lst:
+                    for eng in lst:
+                        if eng.lower().strip() in text_l:
+                            hits.add(eng)
+        for eng in self.nonplain_short:
+            if eng.lower().strip() in text_l:
+                hits.add(eng)
+
+        if not hits:
+            return {}
+        g = self.glossary
+        return {e: g[e] for e in sorted(hits, key=self.order.__getitem__)}
 
 def filter_relevant_terms(glossary: dict, text_l: str,
                           ctx: tuple[set, dict] | None = None) -> dict:

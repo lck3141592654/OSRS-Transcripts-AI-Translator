@@ -3,11 +3,13 @@
 import asyncio
 import time
 
+import httpx
 from openai import AsyncOpenAI
 
 from api_config import (
     load_api_configs, REQUEST_INTERVAL,
     SINGLE_API_EXTRA_429_TOLERANCE,
+    API_CONNECT_TIMEOUT, API_READ_TIMEOUT, API_WRITE_TIMEOUT, API_POOL_TIMEOUT,
 )
 
 
@@ -73,7 +75,20 @@ class SharedBatchPool:
         for cfg in active:
             self._worker_states.append({
                 "cfg": cfg,
-                "client": AsyncOpenAI(api_key=cfg.key, base_url=cfg.base_url),
+                "client": AsyncOpenAI(
+                    api_key=cfg.key,
+                    base_url=cfg.base_url,
+                    # 關閉 SDK 內建重試：程式自己已有 3 次重試迴圈，
+                    # 兩者相乘會讓單一批次的最壞嘗試次數變成 9 次。
+                    max_retries=0,
+                    # 分項逾時：整數 timeout 會把 connect 也變成 1 小時
+                    timeout=httpx.Timeout(
+                        connect=API_CONNECT_TIMEOUT,
+                        read=API_READ_TIMEOUT,
+                        write=API_WRITE_TIMEOUT,
+                        pool=API_POOL_TIMEOUT,
+                    ),
+                ),
                 "sem": asyncio.Semaphore(cfg.parallel_limit),
                 "rate_lock": asyncio.Lock(),
                 "last_request": 0.0,

@@ -11,12 +11,14 @@
 An AI-powered automated pipeline designed for large-scale game text translation. Scripts can be placed anywhere — no specific project structure required.
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update v0.4.5 (6/10/2026), see [Changelog](Changelog.md) for details
-- **Large-sheet scan speedup**: the term gate now uses a safe upper bound plus a per-row narrowing step; 178 KB of text went from 34.6s to 0.2s (7 MB sheets went from minute-class to seconds; with a very large glossary the old code could take hours)
-- **More accurate term matching**: multi-word terms now enforce word boundaries and use rule-based plural forms (new matches such as `White wolf` / "white wolves" and `person` / "people", while false positives like `Attack mix(2)` and `Black 2h sword` are gone); terms containing brackets/digits/dots now match at all
-- **429 and shared-pool hardening**: detection is now a single implementation (429 status code, the `rate limit` family, `too many requests` / `quota exceeded`) and every 429 restarts a 60-second cooldown; fixed `close()` leaving forever-pending futures and a cooldown requeue that could drop a running job
-- **Unified missing-value checks**: `pd.NA` / `NaT` no longer break prompt JSON; `nan` / `nat` / `none` markers in old checkpoints or backups are no longer restored as translations; report deduplication covers every output
-- **Python version**: this release explicitly requires **Python 3.10 or later**
+## Latest Update v0.4.6 (20/10/2026), see [Changelog](Changelog.md) for details
+- **Much faster term scanning**: new TL4 candidate index (inverted index for plain terms, 3-gram index for terms with punctuation or digits); `narrow_relevant_glossary` cold start drops from 14-16s to 0.42-0.48s and `scan_issues` takes 0.21s for 3,000 rows; main translation, retranslation, P2 evaluation and P3 polish share one index instead of rebuilding it per batch
+- **Leaner prompts**: main translation sends only `index` and `english`, dropping `notes`, `wiki_url` and the "return an empty string for unchanged translations" instruction; batch payload shrinks from 16,564 to 7,253 characters (-56%)
+- **Resume and I/O**: `progress.json` is maintained incrementally (one checkpoint-directory scan per sheet) and translation/P3 persist after every batch; a fresh translation run reads the Excel file only once; `iterrows` hot spots vectorised; the review report is coloured while writing
+- **Timeouts and 429**: the LLM client now uses per-phase timeouts (connect 60 / read 1,800 / write 300 / pool 300 seconds) with SDK retries disabled, and the per-request `timeout=` overrides at four call sites are removed; duplicate 429s received while cooling down no longer add extra strikes
+- **Main API default concurrency is now 100**: `MAIN_DEFAULT_LIMIT` changed from 10 to 100; main APIs without `APIx_PARALLEL_LIMIT` in `.env` now default to 100 (lower the concurrency if you hit 429s)
+- **Misc**: removed unused `API_TIMEOUT` imports from `enforcer.py` / `llm_translator.py` / `proofreader.py`
+- **Simplified** the content of README.md and README_en.md
 
 ### Features
 
@@ -39,7 +41,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `batch_proofread.py` | **Proofreading script** — interactive entry point (Full / Quick) |
 | `proofreader.py` | **Proofreading core module** — LLM dual-round evaluation + polishing + retranslation protection (incl. quick/retranslation mode) |
 | `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
-| `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
+| `tm_matcher.py` | **Customizable regex templates**: fill in translations automatically to reduce API calls |
 | `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
 | `enforcer.py` | **Four-layer enforcement** (terminology/placeholders/untranslated/spacing), with script preprocessing, auto-correction + color-coded review report |
 | `shared_pool.py` | **Shared batch pool** - one set of API configs, concurrency and 429 state for the whole run |
@@ -55,35 +57,6 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 > - `_debugmessage/` — Low translation rate debug logs (auto-generated, displayed and cleared on next startup)
 > - `_quick_checkpoint/` — Quick proofread resume checkpoint (isolated from full proofreading, auto-deleted after completion)
 
-
-### Pipeline
-
-```
-Main Translation Script
-batch_translate.py → executes in order:
-① glossary.py      Load terminology database
-② tm_matcher.py    Template parameter matching ⚠️ Not yet enabled, will be added in official release
-③ llm_translator.py AI batch translation (all worksheets in parallel)
-④ enforcer.py      Four-layer enforcement + script preprocessing + retranslation (all worksheets in parallel)
-```
-```
-Proofreading Script
-batch_proofread.py → multiple worksheets in parallel (phase barrier):
-① Phase 2: LLM Dual-round Evaluation (all worksheets in parallel)
-② Phase 3: LLM Polish (up to 3 rounds, all worksheets in parallel)
-③ Phase 4a: Retranslation Protection (all worksheets in parallel)
-④ Phase 4b: Template Correction (executed after all worksheets)
-⑤ Generate Reports
-```
-
-```
-Quick Proofread (retranslation mode)
-batch_proofread.py → after choosing "Quick Proofread", only:
-① Phase 4a: Retranslation fixes (terminology/placeholder/untranslated/spacing, all worksheets in parallel)
-② Phase 4b: Template Correction
-③ Generate Reports (quick_proofread_report.xlsx)
-```
-
 ---
 
 ## Installation
@@ -94,35 +67,22 @@ batch_proofread.py → after choosing "Quick Proofread", only:
 pip install openpyxl pandas openai python-dotenv json-repair
 ```
 
-## Configuration
+## Create the `.env` File and Add Your API Key
+- This tool supports any **OpenAI-compatible API**; the recommended option is the `deepseek-flash` model from [DeepSeek Official](https://platform.deepseek.com/)
+- Copy `.env.example` to `.env` and fill in your settings. Two formats are supported; examples below:
 
-### 1. Get an API Key
-
-This tool supports any **OpenAI-compatible API**. Recommended options:
-
-| Platform                                            | Recommended Model | Cost |
-|-----------------------------------------------------|---------------------------------|----|
-| [OpenRouter](https://openrouter.ai/)                | `deepseek/deepseek-v4-flash` | Very low |
-| [DeepSeek Official](https://platform.deepseek.com/) | `deepseek-v4-flash` | Very low |
-| [Nvidia (Free API)](https://build.nvidia.com/)      | `deepseek-ai/deepseek-v4-flash` | Free |
-| [Opencode Zen (Free API)](https://opencode.ai/zen/)     | `deepseek-v4-flash-free` | Free |
-
-### 2. Create the `.env` File
-
-Copy `.env.example` to `.env` and fill in your settings. Two formats are supported; examples below:
-
-#### Multi-API Format (Recommended)
+### Multi-API Format (Optional)
 
 ```env
-# Main API (paid, default concurrency=10)
+# Main API (default concurrency=100)
 API1_TYPE=main
-# API1_PARALLEL_LIMIT=10   <- optional: uncomment to set a custom concurrency
-API1_MODEL_PROVIDER=openrouter
-API1_MODEL=deepseek/deepseek-v4-flash
+# API1_PARALLEL_LIMIT=100   <- optional: uncomment to set a custom concurrency
+API1_MODEL_PROVIDER=Deepseek
+API1_MODEL=deepseek-flash
 API1_API_KEY=sk-your_api_key_here
-API1_BASE_URL=https://openrouter.ai/api/v1
+API1_BASE_URL=https://api.deepseek.com/
 
-# Fallback API (free, default concurrency=1)
+# Fallback API (default concurrency=1, recommended for free APIs)
 API2_TYPE=fallback
 # API2_PARALLEL_LIMIT=1    <- optional: uncomment to set a custom concurrency
 API2_MODEL_PROVIDER=nvidia
@@ -131,15 +91,13 @@ API2_API_KEY=nvapi-your_free_key_here
 API2_BASE_URL=https://integrate.api.nvidia.com/v1
 ```
 
-Legacy single-API format (backward compatible)
+### Legacy Single-API Format (Optional)
 ```env
 API_KEY=sk-your_api_key_here
-MODEL_PROVIDER=openrouter
-MODEL=deepseek/deepseek-v4-flash
-BASE_URL=https://openrouter.ai/api/v1
+MODEL_PROVIDER=Deepseek
+MODEL=deepseek-flash
+BASE_URL=https://api.deepseek.com/
 ```
-> Both formats can coexist — if **any `APIx_` block parses successfully** (the numbering may have gaps, e.g. only `API1_` and `API3_`), the multi-API format is used; if every `APIx_` block is skipped for missing required fields, it falls back to the legacy single-API format. Each API can optionally set `APIx_PARALLEL_LIMIT` to override the category default. Main API default concurrency=10, fallback API default concurrency=1. `.env` is loaded from the script's own directory, independent of the working directory you launch it from.
-
 ---
 
 ## Usage
@@ -209,20 +167,6 @@ If the translation/proofreading is interrupted due to network issues, API errors
 2. The script automatically scans `workplace/_checkpoint/session.json` (translation), `workplace/_proofread_checkpoint/session.json` (full proofreading) or `workplace/_quick_checkpoint/session.json` (quick proofreading) to detect unfinished progress
 3. Displays a summary of the last translation settings (Excel, worksheet, progress)
 4. Asks whether to resume:
-
-```
-============================================================
-  Unfinished translation progress detected!
-============================================================
-  Excel: transcript_zh.xlsx
-  Worksheet progress: 1/3 sheets
-  Current sheet: dialogue
-  Glossary: glossary.xlsx
-============================================================
-
-Resume translation? (Y/n):
-```
-
 5. Choose `Y` → automatically loads glossary settings, restores translated/proofread entries, and resumes from the interruption point
 6. Choose `n` → clears old checkpoint and starts a fresh translation
 
@@ -273,14 +217,13 @@ IGNORE_LIST: set[str] = {
 - Any common English word you don't want checked as terminology can be added
 - Adding a word also matches its **singular/plural/case** forms (e.g., adding `Egg` automatically filters `Eggs`, `EGGS`; conversely, listing a plural such as `Cages` also ignores the singular `Cage`). Words ending in `-ses` are inherently ambiguous (e.g. `buses`→`bus`, while `bus` itself normalizes to `bu`), so use the same form in both the glossary and the list.
 - Entries with the same name already in the Excel glossary will also be ignored
+- **Do not add proper nouns** (character names, locations, race names, etc.): entries in this list are filtered out when the glossary loads, so the term never reaches the prompt and neither term enforcement nor quick proofread can check it
 
 ---
 
 ## Template Matching (tm_matcher)
 
-⚠️ **This feature is not yet enabled** (the `TEMPLATES` list is empty). All entries are currently handled entirely by AI translation.
-
-Template matching will be added in the **official release**. Users will then be able to define regex templates for automatic translation fill-in (e.g., `"Talk to (.+?)\."` → `"与{0}对话。"`), reducing the number of API calls. Interested users can refer to the comments in `tm_matcher.py` to learn the syntax in advance.
+Template matching can be used to define regex templates that fill in the translation automatically (e.g., `"Talk to (.+?)\."` → `"与{0}对话。"`), reducing the number of API calls. Interested users can refer to the comments in `tm_matcher.py` to learn the syntax.
 
 Fill-in rules: `{}` placeholders map to `{0}{1}...` in order (the first `{}` is `{0}`), and you can also write `{0}{1}` yourself to control word order. If a template cannot be filled completely (more placeholders than captured arguments, or an out-of-range index) it is **not applied** and the entry goes to the AI instead (a literal `{2}` is never written into a translation).
 
@@ -293,40 +236,28 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 | Constant | Default | Description |
 |------|--------|------------------------------|
 | `BATCH_SIZE_LIMIT` | 100 | Max entries per API request batch (llm_translator.py) |
-| `MAIN_DEFAULT_LIMIT` | 10 | Main API default concurrency (api_config.py) |
+| `MAIN_DEFAULT_LIMIT` | 100 | Main API default concurrency (api_config.py) |
 | `FALLBACK_DEFAULT_LIMIT` | 1 | Fallback API default concurrency (api_config.py) |
 | `REQUEST_INTERVAL` | 1 | Interval in seconds between requests from the same API (api_config.py) |
-| `API_TIMEOUT` | 3600 | Unified timeout in seconds for all LLM requests (api_config.py) |
+| `API_CONNECT_TIMEOUT` / `API_READ_TIMEOUT` / `API_WRITE_TIMEOUT` / `API_POOL_TIMEOUT` | 60 / 1800 / 300 / 300 | Per-phase timeout values in seconds (api_config.py); SDK retries are disabled (`max_retries=0`) and handled by the script's own 3 retry attempts |
 | `PERMANENT_DISABLE_AFTER` | 2 | Permanently disable an API after the Nth 429 (api_config.py); relaxed dynamically when only one usable API remains (see below) |
 | `SINGLE_API_EXTRA_429_TOLERANCE` | 3 | Extra 429s tolerated when only one usable API remains: threshold = your configured value + 3 (default 5). It reverts as soon as another API is usable again (reversible; never overrides a value you raised or lowered) |
 | `OVER_RETURN_TOLERANCE` | 1.2 | A batch is treated as failed and retried when it returns more than 1.2x the requested entry count (api_config.py) |
 
 > What counts as a 429: the 429 status code, a standalone `429` in the message, the `rate limit` family (`rate limit` / `rate_limit` / `rate-limit` / `ratelimit`), plus `too many requests` and `quota exceeded`. Any detected 429 **restarts** the 60-second cooldown (the timer resets every time) and the API is permanently disabled only after reaching the threshold.
 
-> When adjusting concurrency: you can set `APIx_PARALLEL_LIMIT` in `.env` for individual APIs, or modify the category defaults in `api_config.py`. Setting it too high may trigger API endpoint rate limits. The defaults of main=10 and fallback=1 have been tested as the optimal balance point.
+> When adjusting concurrency: you can set `APIx_PARALLEL_LIMIT` in `.env` for individual APIs, or modify the category defaults in `api_config.py`. Setting it too high may trigger API endpoint rate limits. The defaults are main=100 and fallback=1; lower the concurrency if you hit 429s.
 
 ---
 
-## Performance Reference
+## Performance Reference (after v0.4.6)
 
-### Large-sheet scanning (term matching)
+### DeepSeek-V4.1-Flash-1017 Off-Peak Benchmarks (cache 0.02 RMB/input 1 RMB/output 4 RMB)
 
-| Scenario | Before | After |
-|----------|--------|-------|
-| Term gate (178 KB of text) | 34.6s | 0.2s |
-| Term gate (2.85 MB of text) | minutes or more | about 3.4s (linear in text length) |
-| `scan_issues` (1,000 rows, full glossary) | 4.33s | 0.95s |
-
-> The difference grows with glossary size: the old cost was proportional to "terms x text length", while the new path uses a safe upper bound plus per-row narrowing, producing exactly the same issue sets and batch prompts.
-
-### DeepSeek V4 Flash Benchmarks (cache 0.02 RMB/input 1 RMB/output 2 RMB)
-
-| Entries | Avg Cost (Translation) | Translation Time (3 runs) | Avg Cost (Proofreading) | Proofreading Time (3 runs) |
-|---------|---------------|----------------|----------|----------------|
-| 500 | 0.01-0.02 USD | 329s, 467s, 353s | 0.02 USD | 350s, 387s, 461s |
-| 2,000 | 0.06-0.07 USD | 801s, 746s, 696s | 0.07-0.08 USD | 912s, 1243s |
-| 5,000 | 0.14 USD | 2084s, 1465s, 2170s | — | — |
-| 75,000 | 2.39 USD | 8 hours | — | — |
+| Entries | Avg Cost (Translation) | Translation Time | Avg Cost (Proofreading) | Proofreading Time |
+|---------|---------------|------------------|----------|------|
+| 1,000   | ~1 RMB        | 88s              | ~1 RMB   | 142s |
+| 5,000   | 1-2 RMB       | 312s             | —        | —    |
 
 ---
 
@@ -342,9 +273,6 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 
 **Q: API requests keep failing or timing out**
 <br>A: Check that `BASE_URL` and `MODEL` in `.env` are correct. If using OpenRouter, verify your account balance is sufficient. You can also try lowering the concurrency of your main/fallback APIs to reduce rate limit risk.
-
-**Q: Translation speed is much slower than expected**
-<br>A: First check the time of day — daytime being ~20% slower than late night is normal. If it's still slow at night, check your network connection or try switching API endpoints.
 
 **Q: The terminal keeps printing "429, cooling down for 60 seconds"**
 <br>A: That is expected behaviour: every 429 restarts a 60-second cooldown for that API, and its jobs are requeued and picked up by the other APIs in the meantime. The API is permanently disabled only after reaching the threshold (2 by default; relaxed automatically to 5 when only one usable API remains). If it happens often, lower the concurrency or add another API key.

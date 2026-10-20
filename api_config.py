@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # 類別級預設並發（硬編碼）
-MAIN_DEFAULT_LIMIT = 10
+MAIN_DEFAULT_LIMIT = 100
 FALLBACK_DEFAULT_LIMIT = 1
 
 # 每個 API 獨立的最小請求間隔（秒）
@@ -21,6 +21,21 @@ REQUEST_INTERVAL = 1
 
 # 所有 LLM 請求的統一逾時（秒）
 API_TIMEOUT = 3600
+
+# 分項逾時（秒）：整數 timeout=API_TIMEOUT 會被 httpx 展開成「所有分項都是 3600」，
+# 連線逾時因此從 SDK 預設的 5 秒膨脹成 1 小時；連線卡住時 worker 會抱著
+# semaphore 名額不放，asyncio.gather 讓整個 phase 一起停擺。
+#
+# 使用者指定的值（2026-10-08 確認）：
+#   connect = 60   —— SDK 預設只有 5 秒；正常連線 1 秒內完成，60 秒已非常寬鬆
+#   read    = 1800 —— 這就是「等 API 回覆的時間」= 30 分鐘。非串流回應下資料是在
+#                     生成完成後才整批送回來，所以 read 實質等於總等待時間
+#   write   = 300  —— 寬鬆值；實際一批只有約 18 KB，真正需要的是幾秒
+#   pool    = 300  —— 寬鬆值；等待連線池名額幾乎不會觸發
+API_CONNECT_TIMEOUT = 60
+API_READ_TIMEOUT = 1800
+API_WRITE_TIMEOUT = 300
+API_POOL_TIMEOUT = 300
 
 # 429 停用次數：累計第 N 次 429 後永久停用（預設 2，可自行調整）
 PERMANENT_DISABLE_AFTER = 2
@@ -239,14 +254,18 @@ class ApiConfig:
         return time.monotonic() < self.cooldown_until
 
     def mark_429(self) -> None:
-        """記錄一次 429 並重新進入 60 秒冷卻（永久停用的判斷由呼叫端看 disable_after）。
+        """記錄一次 429，並重新進入 60 秒冷卻。
 
-        每一次 429 都要重設冷卻：只設第一次的話，之後的 429（例如單一 API 池的
-        第 2～4 次）不會退避，worker 會連續打已經在限流的端點。
+        同一冷卻窗內只累計一次 strike：一個 API 有 parallel_limit 個並行請求，
+        觸頂時同一秒內完成的 10 個回應可能全部是 429；若每個都累加，
+        strike 會一次跳 10、直接越過 PERMANENT_DISABLE_AFTER 而永久停用該 API，
+        整個 phase 隨之中止。冷卻本身仍然每次重新計時（需求不變）。
         """
         import time
-        self.strike += 1
-        self.cooldown_until = time.monotonic() + 60
+        now = time.monotonic()
+        if not self.is_cooling_down:
+            self.strike += 1
+        self.cooldown_until = now + 60
 
     @property
     def is_permanently_disabled(self) -> bool:

@@ -1,5 +1,25 @@
 # Changelog
 
+## 20/10/2026 v0.4.5 -> v0.4.6
+
+### 中文
+- 術語比對新增 TL4 候選索引（純英文術語用倒排索引、含標點或數字的術語用 3-gram 索引），`narrow_relevant_glossary` 冷啟動由 14–16 秒降至 0.42–0.48 秒、`scan_issues` 3,000 列 0.21 秒；主翻譯、重譯、P2 評估、P3 潤色共用同一份索引，不再逐批重建
+- 主翻譯只送 `index` 與 `english`，移除 `notes`、`wiki_url` 與「譯文相同請回傳空字串」的要求，同批次 payload 由 16,564 降至 7,253 字元（−56%）
+- `progress.json` 改為增量維護（每張工作表只掃一次 checkpoint 目錄），翻譯與 P3 每批完成即落盤；全新翻譯路徑的 Excel 只讀一次（`validate_columns`／`get_frame` 改吃已載入的 frames）；`iterrows` 熱點向量化；審查報告改在 `ExcelWriter` 寫入時直接上色
+- 逾時與 429：client 改為分項逾時 connect 60／read 1,800／write 300／pool 300 秒並關閉 SDK 重試（`max_retries=0`），移除四個呼叫點的 per-request `timeout=` 覆蓋；並行請求同時 429 時，冷卻中的重複 429 只刷新冷卻、不再累計 strike
+- 主 API 預設並發 10 → 100（`MAIN_DEFAULT_LIMIT`）；沒有在 `.env` 設定 `APIx_PARALLEL_LIMIT` 的主 API 現在預設用 100，`.env.example` 與 README 兩版同步更新
+- 移除 `enforcer.py`／`llm_translator.py`／`proofreader.py` 未使用的 `API_TIMEOUT` import
+- 簡化README.md、README_en.md的內容
+
+### English
+- new TL4 candidate index for term matching (inverted index for plain terms, 3-gram index for terms with punctuation or digits); `narrow_relevant_glossary` cold start drops from 14-16s to 0.42-0.48s and `scan_issues` takes 0.21s for 3,000 rows; main translation, retranslation, P2 evaluation and P3 polish share one index instead of rebuilding it per batch
+- main translation sends only `index` and `english`, dropping `notes`, `wiki_url` and the "return an empty string for unchanged translations" instruction; batch payload shrinks from 16,564 to 7,253 characters (-56%)
+- `progress.json` is maintained incrementally (one checkpoint-directory scan per sheet) and translation/P3 persist after every batch; a fresh translation run reads the Excel file only once (`validate_columns` / `get_frame` reuse the loaded frames); `iterrows` hot spots vectorised; the review report is coloured while writing through `ExcelWriter`
+- Timeouts and 429: the client now uses per-phase timeouts of connect 60 / read 1,800 / write 300 / pool 300 seconds with SDK retries disabled (`max_retries=0`), and the per-request `timeout=` overrides at four call sites are removed; duplicate 429s received while cooling down only refresh the cooldown instead of adding strikes
+- Main API default concurrency 10 -> 100 (`MAIN_DEFAULT_LIMIT`); main APIs without `APIx_PARALLEL_LIMIT` in `.env` now default to 100, with `.env.example` and both READMEs updated accordingly
+- removed unused `API_TIMEOUT` imports from `enforcer.py` / `llm_translator.py` / `proofreader.py`
+- Simplified the content of README.md and README_en.md
+
 ## 6/10/2026 v0.4.4 -> v0.4.5
 
 ### 中文

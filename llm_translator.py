@@ -3,9 +3,10 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from dotenv import load_dotenv
-from glossary import find_term_spans, build_relevance_context, MISSING_SENTINELS
+from glossary import (find_term_spans, build_relevance_context, MISSING_SENTINELS,
+                      drop_placeholder_spans)
 from api_config import (
-    API_TIMEOUT, OVER_RETURN_TOLERANCE,
+    OVER_RETURN_TOLERANCE,
     is_rate_limit_error, is_rate_limit_payload, RateLimitPayloadError,
 )
 
@@ -96,19 +97,29 @@ SYSTEM_PROMPT_BASE = (
     "你必須使用'.'分隔，不要自行改為'·'或其他方式。你必須使用'.'分隔，不要自行改為'·'或其他方式。\n"
     "8. 输出格式为原始 JSON 阵列（不要使用 ```json 代码块包裹），每条物件包含 "
     "\"index\" 和 \"translation\" 两个栏位\n"
-    "9. 如有 notes、wiki_url 等原始栏位，一并保留在输出物件中\n\n"
+    "9. 只输出 index 和 translation 两个栏位，不要回传 notes、wiki_url 或其他栏位\n\n"
     "## 强制术语表（禁止使用官方和社区通常的翻譯，遇到以下英文词必须使用指定的中文翻译）\n"
     "{RELEVANT_GLOSSARY}"
 )
 
 
-def get_relevant_glossary(batch, glossary):
-    """只回傳當前批次有出現的術語（含複數歸一化匹配）。"""
+def get_relevant_glossary(batch, glossary, lookup=None):
+    """只回傳當前批次有出現的術語（含複數歸一化匹配）。
+
+    lookup：可選的 TermLookup；由呼叫端每個階段建一次共用。TL4 的全詞庫建構
+    要 0.125 秒，逐批重建比舊版逐條掃描還慢（實測 0.116 vs 0.069 秒/批）。
+    """
+    from glossary import TermLookup
     batch_text = " ".join(item.get("english", "") for item in batch).lower()
     _ctx = build_relevance_context(batch_text)
+    if lookup is None:
+        lookup = TermLookup(glossary)
     term_matches = []
-    for eng, chn in glossary.items():
+    for eng, chn in lookup.candidates(batch_text, _ctx).items():
         spans = find_term_spans(eng, batch_text, _ctx)
+        # [...] 佔位符內的英文不可翻譯：只出現在佔位符裡的術語不進提示詞
+        # （否則 [Fremennik name] 會讓模型以為要把佔位符內容翻成中文）
+        spans = drop_placeholder_spans(spans, batch_text)
         if spans:
             term_matches.append((eng, chn, spans))
     if not term_matches:
@@ -217,6 +228,20 @@ def save_progress(output_dir, completed_indices: list, sheet_name=None):
     atomic_write_text(cd / PROGRESS_FILE, json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def _progress_indices(backup: dict) -> list:
+    """把 part 檔備份的鍵轉成排序後的整數索引清單（與 sync_progress 同口徑）。
+
+    單一壞 key（備份檔損壞或人為編輯）只跳過該筆，不讓整份進度失敗。
+    """
+    out = []
+    for k in backup:
+        try:
+            out.append(int(k))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
 # ── Session 檔案 ──
 
 def save_session(output_dir, session_info: dict):
@@ -300,15 +325,17 @@ def delete_checkpoint_files(output_dir, sheet_name=None):
 
 # ── LLM API 調用 ──
 
-async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
+async def _translate_batch(client, model_name, batch, glossary, api_id="?", lookup=None):
     """發送單一批次到 LLM API 進行翻譯"""
-    relevant = get_relevant_glossary(batch, glossary)
+    relevant = get_relevant_glossary(batch, glossary, lookup)
     glossary_str = "\n".join([f"  {e} → {c}" for e, c in relevant]) if relevant else "  无"
     system_prompt = SYSTEM_PROMPT_BASE.replace("{RELEVANT_GLOSSARY}", glossary_str)
 
+    # 只送 index 與 english：notes／wiki_url 佔 payload 的 56%（實測 dialogue 前 100 列），
+    # 且兩者本來就在 DataFrame 裡、輸出檔直接沿用來源欄位，
+    # 模型回傳的這兩個欄位一向被丟棄（見 translate_sheet_phase 的寫回路徑）。
     user_content = json.dumps([
-        {"index": item["_idx"], "english": item["english"],
-         "notes": _json_safe(item.get("notes")), "wiki_url": _json_safe(item.get("wiki_url"))}
+        {"index": item["_idx"], "english": item["english"]}
         for item in batch
     ], ensure_ascii=False)
 
@@ -323,7 +350,6 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                 ],
 
                 temperature=0.1,
-                timeout=API_TIMEOUT,
             )
             # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
             text = resp.choices[0].message.content.strip()
@@ -505,14 +531,26 @@ def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None
     if "translation" not in df.columns:
         df["translation"] = None
     pending = []
-    for idx, row in df.iterrows():
-        if is_missing_translation(row.get("translation"), english=_english_hint(row.get("english"))):
+    english_vals = df["english"].map(str).tolist() if "english" in df.columns else [""] * len(df)
+    # ⚠️ _english_hint 必須吃「原始值」：舊版 row.get("english") 對 NaN 給 None；
+    # 若傳 map(str) 後的 "nan"，_english_hint("nan") 會回 "nan"，於是
+    # english=NaN、translation 字串 "nan" 的列會從「缺值」變成「已翻譯」——
+    # 這是真實的語意改變（只是目前真實語料剛好沒有這種列）。
+    english_raw = df["english"].tolist() if "english" in df.columns else [None] * len(df)
+    sub_vals = (df["sub_category"].map(str).tolist() if "sub_category" in df.columns
+                else [""] * len(df))
+    trans_vals = df["translation"].tolist() if "translation" in df.columns else [None] * len(df)
+    notes_vals = df["notes"].tolist() if "notes" in df.columns else [None] * len(df)
+    wiki_vals = df["wiki_url"].tolist() if "wiki_url" in df.columns else [None] * len(df)
+    for idx, eng_raw, eng_val, sub_val, trans_val, notes_val, wiki_val in zip(
+            df.index, english_raw, english_vals, sub_vals, trans_vals, notes_vals, wiki_vals):
+        if is_missing_translation(trans_val, english=_english_hint(eng_raw)):
             pending.append({
                 "_idx": idx,
-                "english": str(row["english"]),
-                "sub_category": str(row.get("sub_category", "")),
-                "notes": row.get("notes"),
-                "wiki_url": row.get("wiki_url"),
+                "english": str(eng_val),
+                "sub_category": sub_val,
+                "notes": notes_val,
+                "wiki_url": wiki_val,
             })
     if not pending:
         print("  所有条目已完成，无需翻译")
@@ -524,8 +562,14 @@ def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None
 async def translate_sheet_phase(df, glossary, output_dir, pending, sheet_name, pool):
     # Submit this worksheet translation batches to the shared pool and update df.
     batches = _group_into_batches(pending)
+    # 每個工作表只掃一次 checkpoint 目錄，之後用記憶體累加。
+    # 原本每批都呼叫 sync_progress → load_backup 會 glob 並解析全部 part 檔，
+    # 第 k 批要讀 k 個檔，總共 N(N+1)/2 次（750 批約 28 萬次）。
+    completed_indices = _progress_indices(load_backup(output_dir, sheet_name))
     total_batches = len(batches)
     session_tag = uuid.uuid4().hex[:8]
+    from glossary import TermLookup
+    lookup = TermLookup(glossary)          # 每張工作表只建一次（0.125 秒）
 
     async def _process_batch(ws, job):
         cfg = ws["cfg"]
@@ -533,7 +577,8 @@ async def translate_sheet_phase(df, glossary, output_dir, pending, sheet_name, p
         batch_indices = {item["_idx"] for item in batch}
         _timestamp(f"[{sheet_name}] 批次 {batch_num}/{total_batches} 開始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
         try:
-            results = await _translate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
+            results = await _translate_batch(ws["client"], cfg.model, batch, glossary,
+                                             cfg.api_id, lookup=lookup)
             new_backup = {}
             skipped = 0
             for res in results:
@@ -565,7 +610,16 @@ async def translate_sheet_phase(df, glossary, output_dir, pending, sheet_name, p
                 print(f"    [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件、index 不在工作表中或譯文非字串），已忽略")
             if new_backup:
                 save_backup_part(output_dir, session_tag, batch_num, new_backup, sheet_name)
-                sync_progress(output_dir, sheet_name)
+                # 增量維護 progress.json：內容與 sync_progress 推導出來的完全相同
+                # （同樣涵蓋跨執行的舊 tag）。每批的成本變成「本批條數 + 一次排序」
+                # O(N log N)（N=已完成條數；103,257 列 / 1,033 批實測約 2.4 秒 CPU），
+                # 仍遠低於舊版每批 glob＋解析整份 checkpoint 目錄的 I/O。
+                for k in new_backup:
+                    try:
+                        completed_indices.append(int(k))
+                    except (TypeError, ValueError):
+                        continue
+                save_progress(output_dir, sorted(set(completed_indices)), sheet_name)
             _timestamp(f"[{sheet_name}] 批次 {batch_num}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
         except Exception as e:
             if is_rate_limit_error(e):

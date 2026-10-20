@@ -30,11 +30,15 @@ def elapsed(start, label):
     secs = (datetime.now() - start).total_seconds()
     print(f"  [{label}] 耗時: {secs:.1f} 秒")
 
-def validate_columns(excel_path, sheet_names, required=("english", "translation")) -> bool:
-    """檢查目標工作表是否具備必要欄位，避免後續 KeyError。"""
+def validate_columns(frames, sheet_names, required=("english", "translation")) -> bool:
+    """檢查目標工作表是否具備必要欄位（使用呼叫端已載入的 frames，不重複讀檔）。"""
     ok = True
     for sn in sheet_names:
-        df = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
+        df = frames.get(sn)
+        if df is None:
+            print(f"  錯誤：找不到工作表「{sn}」的資料")
+            ok = False
+            continue
         missing = [c for c in required if c not in df.columns]
         if missing:
             print(f"  錯誤：工作表「{sn}」缺少必要欄位: {', '.join(missing)}")
@@ -355,21 +359,24 @@ def main():
     excel_path = step1()
     glossary_path, glossary_sheets = step2(excel_path)
     sheet_names = step3(excel_path)
-    if not validate_columns(excel_path, sheet_names):
+    frames = {}
+    for sn in sheet_names:
+        frames[sn] = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
+    if not validate_columns(frames, sheet_names):
         input("\n按 Enter 鍵...")
         return
     sheet_configs = {}
-    cached_dfs = {}
     for sn in sheet_names:
         print(f"\n  --- 工作表: {sn} ---")
-        df_full = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
-        cached_dfs[sn] = df_full
+        df_full = frames[sn]
         if "translation" in df_full.columns:
             has_t = int(translated_mask(df_full).sum())
             print(f"    總行數: {len(df_full)}，有翻譯: {has_t}")
         sel = step4(excel_path, sn, df_full)
         sheet_configs[sn] = {"selected_indices": sel}
-    del cached_dfs
+    # run_proofread 之後會自己讀檔（excel_path 可能來自續傳 session），
+    # 這裡的 frames 只是用來避免驗證與選取階段重複讀檔，用完即釋放。
+    del frames
     total_selected = sum(len(cfg["selected_indices"]) for cfg in sheet_configs.values())
     if total_selected == 0:
         print("\n未選取任何條目。")

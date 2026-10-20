@@ -11,12 +11,14 @@
 這是一套專為大規模遊戲文本翻譯設計的 AI 自動化管線。腳本目錄可任意放置，無需特定專案結構。
 > ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
 
-## 最近更新 v0.4.5 (6/10/2026)，更新詳情請看 [Changelog](Changelog.md)
-- **大表掃描加速**：術語閘門改用安全上界，並先逐列收斂出真正命中的術語；178 KB 文字由 34.6 秒降至 0.2 秒（7 MB 級工作表由分鐘級降到秒級，術語特別多時原本可達小時級）
-- **術語匹配更準**：多字詞術語加入詞界檢查、改用規則式複數形（新增 `White wolf` / "white wolves"、`person` / "people" 等命中，並修掉 `Attack mix(2)`、`Black 2h sword` 等假陽性）；含括號/數字/句點的術語原本永遠匹配不到，已修復
-- **429 與並發池強化**：判定收斂為單一實作（429 狀態碼、`rate limit` 系列寫法、`too many requests`／`quota exceeded`），每次 429 都重新冷卻 60 秒；修正 `close()` 留下永遠 pending 的 future，以及冷卻重排會誤刪其他 worker 登記導致任務遺失的問題
-- **缺值判定統一**：`pd.NA`／`NaT` 不再讓提示詞 JSON 崩潰；舊檢查點／備份裡的 `nan`／`nat`／`none` 不再被當成譯文還原；報告去重涵蓋全部輸出
-- **Python 版本**：本版起明確要求 **Python 3.10 或以上**
+## 最近更新 v0.4.6 (20/10/2026)，更新詳情請看 [Changelog](Changelog.md)
+- **術語掃描大幅加速**：新增 TL4 候選索引（純英文術語用倒排索引、含標點或數字的術語用 3-gram 索引），`narrow_relevant_glossary` 冷啟動由 14–16 秒降至 0.42–0.48 秒、`scan_issues` 3,000 列 0.21 秒；主翻譯、重譯、P2 評估、P3 潤色共用同一份索引，不再逐批重建
+- **提示詞更精簡**：主翻譯只送 `index` 與 `english`，移除 `notes`、`wiki_url` 與「譯文相同請回傳空字串」的要求；同批次 payload 由 16,564 降至 7,253 字元（−56%）
+- **續傳與 I/O 優化**：`progress.json` 改為增量維護（每張工作表只掃一次 checkpoint 目錄）、翻譯與 P3 每批完成即落盤；全新翻譯路徑的 Excel 只讀一次；`iterrows` 熱點向量化；審查報告改在寫入時直接上色
+- **逾時與 429**：LLM client 改用分項逾時（connect 60／read 1,800／write 300／pool 300 秒）並關閉 SDK 重試，移除四個呼叫點的 per-request `timeout=` 覆蓋；並行請求同時 429 時，冷卻中的重複 429 不再重複累計 strike
+- **主 API 並發預設改為 100**：`MAIN_DEFAULT_LIMIT` 由 10 調整為 100；沒有在 `.env` 設定 `APIx_PARALLEL_LIMIT` 的主 API 現在預設用 100（若遇到 429 請調降並發）
+- **其他**：移除 `enforcer.py`／`llm_translator.py`／`proofreader.py` 未使用的 `API_TIMEOUT` import
+- **簡化**README.md、README_en.md的內容
 
 ### 特色
 
@@ -39,7 +41,7 @@
 | `batch_proofread.py` | **校對腳本** — 互動式操作入口（完整校對 / 快速校對） |
 | `proofreader.py` | **校對核心模組** — LLM 雙輪評估 + 潤色 + 重譯保護（含快速校對/重譯模式） |
 | `glossary.py` | 讀取術語庫 Excel 或自動萃取術語庫 + 輸出審查檔 |
-| `tm_matcher.py` | 模板化比對（**尚未啟用**，將在正式版加入） |
+| `tm_matcher.py` | **可自訂正則模板**：讓腳本自動填入翻譯，減少 API 調用次數 |
 | `llm_translator.py` | **AI 批次翻譯核心**，非同步並行調用，含智慧 JSON 提取與 json_repair 修復 |
 | `enforcer.py` | **四層強制檢查**（術語/佔位符/未翻譯/空格），附腳本預處理，自動修正+產出彩色審查報告 |
 | `shared_pool.py` | **共享批次池** — 整個執行共用一份 API 配置、並發與 429 冷卻狀態 |
@@ -55,34 +57,6 @@
 > - `_debugmessage/` — 低翻譯率 debug 記錄（自動產生，下次啟動時顯示後清除）
 > - `_quick_checkpoint/` — 快速校對續傳暫存（獨立於完整校對，完成後自動刪除）
 
-### 階段流程
-
-```
-主翻譯腳本
-batch_translate.py → 依序執行：
-① glossary.py      載入術語庫
-② tm_matcher.py    模板參數比對 ⚠️ 尚未啟用，將在正式版加入
-③ llm_translator.py AI 批次翻譯（全部工作表並行）
-④ enforcer.py      四層強制檢查 + 腳本預處理 + 重譯（全部工作表並行）
-```
-```
-校對腳本
-batch_proofread.py → 多工作表並行（階段間同步）：
-① Phase 2: LLM 雙輪評估（全部工作表並行）
-② Phase 3: LLM 潤色（最多 3 輪，全部工作表並行）
-③ Phase 4a: 重譯保護（全部工作表並行）
-④ Phase 4b: 模板校正（所有工作表完成後執行）
-⑤ 生成報告
-```
-
-```
-快速校對（重譯模式）
-batch_proofread.py → 選擇「快速校對」後只執行：
-① Phase 4a: 重譯修正（術語/佔位符/未翻譯/空格，全部工作表並行）
-② Phase 4b: 模板校正
-③ 生成報告（quick_proofread_report.xlsx）
-```
-
 ---
 
 ## 安裝
@@ -93,35 +67,22 @@ batch_proofread.py → 選擇「快速校對」後只執行：
 pip install openpyxl pandas openai python-dotenv json-repair
 ```
 
-## 設定
+## 建立 `.env` 檔案，填入 API Key
+- 本工具支援任何 **OpenAI 相容 API**，推薦使用[DeepSeek 官方](https://platform.deepseek.com/)的deepseek-flash模型
+- 複製 `.env.example` 為 `.env`，填入你的設定。支援兩種格式，以下為範本：
 
-### 1. 申請 API Key
-
-本工具支援任何 **OpenAI 相容 API**。推薦的選項：
-
-| 平台                                                | 推薦模型                            | 成本 |
-|---------------------------------------------------|---------------------------------|----|
-| [OpenRouter](https://openrouter.ai/)              | `deepseek/deepseek-v4-flash`    | 極低 |
-| [DeepSeek 官方](https://platform.deepseek.com/)     | `deepseek-v4-flash`                 | 極低 |
-| [Nvidia (免費API)](https://build.nvidia.com/)       | `deepseek-ai/deepseek-v4-flash` | 免費 |
-| [Opencode Zen (免費API)](https://opencode.ai/zen/) | `deepseek-v4-flash-free` | 免費 |
-
-### 2. 建立 `.env` 檔案
-
-複製 `.env.example` 為 `.env`，填入你的設定。支援兩種格式，以下為範本：
-
-#### 多 API 格式（推薦）
+### 多 API 格式（可選）
 
 ```env
-# 主 API（付費，預設並發=10）
+# 主 API（預設並發=100）
 API1_TYPE=main
-# API1_PARALLEL_LIMIT=10   <- 選填：取消註解即可自訂並發數
-API1_MODEL_PROVIDER=openrouter
-API1_MODEL=deepseek/deepseek-v4-flash
+# API1_PARALLEL_LIMIT=100   <- 選填：取消註解即可自訂並發數
+API1_MODEL_PROVIDER=Deepseek
+API1_MODEL=deepseek-flash
 API1_API_KEY=sk-your_api_key_here
-API1_BASE_URL=https://openrouter.ai/api/v1
+API1_BASE_URL=https://api.deepseek.com/
 
-# 副 API（免費，預設並發=1）
+# 副 API（預設並發=1，建議用作免費API）
 API2_TYPE=fallback
 # API2_PARALLEL_LIMIT=1    <- 選填：取消註解即可自訂並發數
 API2_MODEL_PROVIDER=nvidia
@@ -129,15 +90,14 @@ API2_MODEL=deepseek-ai/deepseek-v4-flash
 API2_API_KEY=nvapi-your_free_key_here
 API2_BASE_URL=https://integrate.api.nvidia.com/v1
 ```
-舊版單一 API 格式（向後相容）
+
+### 舊版單一 API 格式（可選）
 ```env
 API_KEY=sk-your_api_key_here
-MODEL_PROVIDER=openrouter
-MODEL=deepseek/deepseek-v4-flash
-BASE_URL=https://openrouter.ai/api/v1
+MODEL_PROVIDER=Deepseek
+MODEL=deepseek-flash
+BASE_URL=https://api.deepseek.com/
 ```
-> 兩種格式可同時存在——只要有**任何 `APIx_` 能成功解析**（編號可跳號，例如只有 `API1_` 與 `API3_`），就使用多 API 格式；若所有 `APIx_` 都因缺少必填欄位而被跳過，才回退到舊版單一 API 格式。每個 API 可選填 `APIx_PARALLEL_LIMIT` 覆蓋類別預設值。主 API 預設並發=10，副 API 預設並發=1。`.env` 以腳本所在目錄載入，與啟動時的工作目錄無關。
-
 ---
 
 ## 使用方法
@@ -204,20 +164,6 @@ Step 5：確認執行          → 開始校對（Phase 2→3→4a→4b→報告
 2. 腳本會自動掃描 `workplace/_checkpoint/session.json`（主翻譯）、`workplace/_proofread_checkpoint/session.json`（完整校對）或 `workplace/_quick_checkpoint/session.json`（快速校對），偵測未完成的進度
 3. 顯示上次的翻譯設定摘要（Excel、工作表、進度）
 4. 詢問是否繼續上次的進度：
-
-```
-============================================================
-  偵測到未完成的翻譯進度！
-============================================================
-  Excel: transcript_zh.xlsx
-  工作進度: 1/3 工作表
-  當前工作表: dialogue
-  術語庫: 术语库.xlsx
-============================================================
-
-繼續翻譯？(Y/n):
-```
-
 5. 選擇 `Y` → 自動載入術語庫設定、還原已翻譯/校對條目，從中斷處繼續
 6. 選擇 `n` → 清除舊暫存，進入全新翻譯流程
 
@@ -267,14 +213,13 @@ IGNORE_LIST: set[str] = {
 - 任何你不想被當作術語檢查的普通英文單詞都可以加入
 - 加入後會同時匹配**單數/複數/大小寫**形態（例如加入 `Egg` 會自動忽略 `Eggs`、`EGGS`；反之清單中寫複數如 `Cages`，也會一併忽略單數 `Cage`）。`-ses` 結尾的字本身有歧義（例如 `buses`→`bus`，而 `bus` 自己會歸一成 `bu`），這類字請在術語庫與清單中使用相同形態
 - 已存在於 Excel 術語庫中的同名條目也會被一併忽略
+- **不要加入專有名詞**（人名、地名、種族名等）：清單內的詞會在載入術語庫時被永久過濾，該術語不會進入提示詞，術語強制與快速校對也檢查不到
 
 ---
 
 ## 模板比對（tm_matcher）
 
-⚠️ **此功能目前尚未啟用**（`TEMPLATES` 列表為空），所有條目目前全部交由 AI 翻譯。
-
-模板比對功能將在**正式版**中加入。屆時可自訂正則模板讓腳本自動填入翻譯（如 `"Talk to (.+?)\."` → `"与{0}对话。"`），減少 API 調用次數。有興趣的使用者可以參考 `tm_matcher.py` 中的說明提前了解語法。
+模板比對功能可用作自訂正則模板讓腳本自動填入翻譯（如 `"Talk to (.+?)\."` → `"与{0}对话。"`），減少 API 調用次數。有興趣的使用者可以參考 `tm_matcher.py` 中的說明了解語法。
 
 填值規則：`{}` 依出現順序對應 `{0}{1}…`（第一個 `{}` 是 `{0}`），也可直接寫 `{0}{1}` 自行安排語序；若模板填不完整（佔位符比捕獲到的參數多，或索引越界），該模板**不會被套用**，該條目改交給 AI 翻譯（不會把字面 `{2}` 寫進譯文）。
 
@@ -287,40 +232,28 @@ IGNORE_LIST: set[str] = {
 | 常數 | 預設值 | 說明                           |
 |------|--------|------------------------------|
 | `BATCH_SIZE_LIMIT` | 100 | 每批 API 請求的最大條數 (llm_translator.py)            |
-| `MAIN_DEFAULT_LIMIT` | 10 | 主 API 預設並發數（api_config.py）   |
+| `MAIN_DEFAULT_LIMIT` | 100 | 主 API 預設並發數（api_config.py）   |
 | `FALLBACK_DEFAULT_LIMIT` | 1 | 副 API 預設並發數（api_config.py）   |
 | `REQUEST_INTERVAL` | 1 | 同一 API 請求間隔秒數（api_config.py） |
-| `API_TIMEOUT` | 3600 | 所有 LLM 請求的統一逾時秒數（api_config.py） |
+| `API_CONNECT_TIMEOUT` / `API_READ_TIMEOUT` / `API_WRITE_TIMEOUT` / `API_POOL_TIMEOUT` | 60 / 1800 / 300 / 300 | 分項逾時秒數（api_config.py）；SDK 重試已關閉（`max_retries=0`），由程式自己的 3 次重試處理 |
 | `PERMANENT_DISABLE_AFTER` | 2 | 累計第 N 次 429 後永久停用該 API（api_config.py）；池中只剩一個可用 API 時會動態放寬（見下） |
 | `SINGLE_API_EXTRA_429_TOLERANCE` | 3 | 池中「只剩一個可用 API」時額外容忍的 429 次數：門檻 = 使用者設定值 + 3（預設 5），其他 API 回來即恢復原值（可逆，不會覆蓋你調高或調低的值） |
 | `OVER_RETURN_TOLERANCE` | 1.2 | 回傳條數超過批次條數 1.2 倍時，該批次視為失敗並重試（api_config.py） |
 
 > 429 判定範圍：429 狀態碼、訊息中獨立的 `429`、`rate limit` 系列寫法（`rate limit` / `rate_limit` / `rate-limit` / `ratelimit`），以及 `too many requests`、`quota exceeded`。判定為 429 時會**重新進入 60 秒冷卻**（每次都會重新計時），累計到門檻才永久停用該 API。
 
-> 調整並發數時請注意：可在 `.env` 中為個別 API 設 `APIx_PARALLEL_LIMIT`，或修改 `api_config.py` 中的類別預設值。數值過高可能觸發 API 端點的 Rate Limit。預設主 API=10、副 API=1 經過實測為最佳平衡點。
+> 調整並發數時請注意：可在 `.env` 中為個別 API 設 `APIx_PARALLEL_LIMIT`，或修改 `api_config.py` 中的類別預設值。數值過高可能觸發 API 端點的 Rate Limit。預設主 API=100、副 API=1；若遇到 429，請調降並發或增加 API Key。
 
 ---
 
-## 效能參考
+## 效能參考 (v0.4.6版本更新後)
 
-### 大表掃描（術語比對）
+### DeepSeek-V4.1-Flash-1017 谷時實測數據（緩存 0.02 RMB/輸入 1 RMB/輸出 4 RMB）
 
-| 情境 | 修正前 | 修正後 |
-|------|--------|--------|
-| 術語閘門（178 KB 文字） | 34.6 秒 | 0.2 秒 |
-| 術語閘門（2.85 MB 文字） | 分鐘級以上 | 約 3.4 秒（與文字長度呈線性） |
-| `scan_issues`（1,000 列、完整詞庫） | 4.33 秒 | 0.95 秒 |
-
-> 詞庫越大差距越明顯：原本的成本與「術語數 × 全文長度」成正比，現在改為安全上界 + 逐列收斂，問題集合與批次提示與原本完全相同。
-
-### DeepSeek V4 Flash 實測數據（緩存 0.02 RMB/輸入 1 RMB/輸出 2 RMB）
-
-| 翻譯數量 | 平均成本（主翻譯）      | 主翻譯耗時（三次測試） | 平均成本（校對） | 校對耗時（三次測試） |
-|---------|---------------|----------------|----------|----------------|
-| 500 條 | 0.01-0.02 USD | 329s, 467s, 353s |0.02 USD| 350s, 387s, 461s |
-| 2000 條 | 0.06-0.07 USD | 801s, 746s, 696s |0.07-0.08 USD| 912s, 1243s| 
-| 5000 條 | 0.14 USD      | 2084s, 1465s, 2170s | — | — |
-| 75000 條 | 2.39 USD | 8 hours | — | — |
+| 翻譯數量    | 平均成本（主翻譯）     | 主翻譯耗時            | 平均成本（校對） | 校對耗時 |
+|---------|---------------|------------------|----------|------|
+| 1000 條  | ~1 RMB        | 88s              | ~1 RMB   | 142s |
+| 5000 條  | 1-2 RMB       | 312s             | —        | —    |
 
 ---
 
@@ -336,9 +269,6 @@ IGNORE_LIST: set[str] = {
 
 **Q：API 請求一直失敗或超時**
 <br>A：檢查 `.env` 中的 `BASE_URL` 和 `MODEL` 是否正確。如果是 OpenRouter，確認帳戶餘額是否足夠。也可嘗試調低主/副 API 的並發數來降低 Rate Limit 風險。
-
-**Q：翻譯速度比預期慢很多**
-<br>A：先確認時段——白天比深夜慢 ~20% 是正常現象。若深夜仍偏慢，可檢查網路連線或嘗試更換 API 端點。
 
 **Q：終端機一直出現「第 N 次 429，冷卻 60 秒」**
 <br>A：這是正常機制：每次 429 都會重新冷卻 60 秒，冷卻期間該 API 的任務會自動排回佇列、由其他 API 接手。累計次數達到門檻（預設 2 次；只剩一個可用 API 時自動放寬為 5 次）才會永久停用該 API。若頻繁發生，請降低並發數或增加一組 API Key。

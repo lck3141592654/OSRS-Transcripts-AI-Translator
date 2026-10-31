@@ -1,4 +1,4 @@
-import json, time, re, asyncio, uuid
+import json, time, re, asyncio, uuid, hashlib, shutil
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -47,8 +47,13 @@ def _json_safe(value):
 
 
 CHECKPOINT_SUBDIR = "_checkpoint"
+# 校對管線（P3 潤色／P4a 重譯）自己的 checkpoint 根目錄。
+# 與主翻譯共用 _checkpoint 會讓 load_backup 把校對的 part 當成主翻譯進度還原
+# （同一個 idx 被校對結果覆蓋），校對結束時的清理也會誤刪主翻譯的續傳進度。
+PROOFREAD_CHECKPOINT_SUBDIR = "_proofread_checkpoint"
 PROGRESS_FILE = "progress.json"
 SESSION_FILE = "session.json"
+SOURCE_FILE = "source.json"
 # 固定工作目錄名稱：除錯訊息等一律寫到程式所在目錄下的這個資料夾
 WORKPLACE_DIR_NAME = "workplace"
 DEBUG_MESSAGE_SUBDIR = "_debugmessage"
@@ -196,11 +201,18 @@ def _sanitize_sheet_name(name: str) -> str:
     """將工作表名稱轉換為安全的目錄名稱。"""
     return re.sub(r'[<>:"/\\|?*]', '_', name)
 
-def _checkpoint_dir(output_dir=None, sheet_name=None) -> Path:
+def _checkpoint_dir(output_dir=None, sheet_name=None, root: str = CHECKPOINT_SUBDIR) -> Path:
+    """回傳 checkpoint 目錄；root 決定是哪一條管線的根目錄。
+
+    root 只允許兩個已知常數：這裡是「目錄寫錯就靜默污染另一條管線」的唯一防線，
+    呼叫端忘記轉發 root 時至少會在開發期 assert 失敗，而不是把校對的 part
+    寫進主翻譯的 _checkpoint（那會讓續傳還原到錯誤的譯文）。
+    """
+    assert root in (CHECKPOINT_SUBDIR, PROOFREAD_CHECKPOINT_SUBDIR), f"未知的 checkpoint root：{root!r}"
     if output_dir:
-        base = Path(output_dir) / CHECKPOINT_SUBDIR
+        base = Path(output_dir) / root
     else:
-        base = Path(__file__).parent / CHECKPOINT_SUBDIR
+        base = Path(__file__).parent / root
     if sheet_name:
         base = base / _sanitize_sheet_name(sheet_name)
     return base
@@ -217,8 +229,9 @@ def atomic_write_text(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
-def save_progress(output_dir, completed_indices: list, sheet_name=None):
-    cd = _checkpoint_dir(output_dir, sheet_name)
+def save_progress(output_dir, completed_indices: list, sheet_name=None,
+                  root: str = CHECKPOINT_SUBDIR):
+    cd = _checkpoint_dir(output_dir, sheet_name, root)
     cd.mkdir(parents=True, exist_ok=True)
     data = {
         "completed_count": len(completed_indices),
@@ -244,17 +257,18 @@ def _progress_indices(backup: dict) -> list:
 
 # ── Session 檔案 ──
 
-def save_session(output_dir, session_info: dict):
-    cd = _checkpoint_dir(output_dir)
+def save_session(output_dir, session_info: dict, root: str = CHECKPOINT_SUBDIR):
+    cd = _checkpoint_dir(output_dir, root=root)
     cd.mkdir(parents=True, exist_ok=True)
     atomic_write_text(cd / SESSION_FILE, json.dumps(session_info, ensure_ascii=False, indent=2))
 
 
 # ── 備份：每批次獨立一個 part 檔案（UUID 避免覆蓋） ──
 
-def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: dict, sheet_name=None):
+def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: dict, sheet_name=None,
+                     root: str = CHECKPOINT_SUBDIR):
     """原子寫入單一批次的 part 檔案（強制同步磁碟後才 rename）"""
-    cd = _checkpoint_dir(output_dir, sheet_name)
+    cd = _checkpoint_dir(output_dir, sheet_name, root)
     cd.mkdir(parents=True, exist_ok=True)
     atomic_write_text(cd / f"part_{session_tag}_{batch_num:06d}.json", json.dumps(batch_data, ensure_ascii=False))
 
@@ -270,7 +284,7 @@ def _part_sort_key(p: Path) -> tuple:
         return (0, p.name)
 
 
-def load_backup(output_dir=None, sheet_name=None) -> dict:
+def load_backup(output_dir=None, sheet_name=None, root: str = CHECKPOINT_SUBDIR) -> dict:
     """掃描所有 part_*.json，以 idx 為鍵合併所有備份資料。
 
     合併順序以檔案的寫入時間（mtime）為準，後寫入者覆蓋先寫入者。
@@ -279,7 +293,7 @@ def load_backup(output_dir=None, sheet_name=None) -> dict:
     還原值會由 tag 字串排序決定（不確定），續傳可能還原到較舊的值；
     改為時間序後，較新的修正（如 enforce 重譯結果）必定勝出。
     """
-    cd = _checkpoint_dir(output_dir, sheet_name)
+    cd = _checkpoint_dir(output_dir, sheet_name, root)
     if not cd.exists():
         return {}
     all_backup: dict = {}
@@ -291,9 +305,9 @@ def load_backup(output_dir=None, sheet_name=None) -> dict:
             pass
     return all_backup
 
-def sync_progress(output_dir=None, sheet_name=None):
+def sync_progress(output_dir=None, sheet_name=None, root: str = CHECKPOINT_SUBDIR):
     """從 backup part 檔案反推 progress.json，確保絕對同步"""
-    backup = load_backup(output_dir, sheet_name)
+    backup = load_backup(output_dir, sheet_name, root)
     # 備份檔損壞或人為編輯時 key 可能不是數字：單一壞 key 不可讓整批同步失敗
     indices = []
     skipped = 0
@@ -306,18 +320,105 @@ def sync_progress(output_dir=None, sheet_name=None):
         print(f"  警告：進度同步略過 {skipped} 個非數字 key（備份檔損壞或人為編輯）")
     indices.sort()
     if indices:
-        save_progress(output_dir, indices, sheet_name)
+        save_progress(output_dir, indices, sheet_name, root)
     else:
-        pp = _checkpoint_dir(output_dir, sheet_name) / PROGRESS_FILE
+        pp = _checkpoint_dir(output_dir, sheet_name, root) / PROGRESS_FILE
         if pp.exists():
             pp.unlink()
 
-def delete_checkpoint_files(output_dir, sheet_name=None):
-    """清除所有 checkpoint 檔案"""
-    cd = _checkpoint_dir(output_dir, sheet_name)
+def delete_checkpoint_files(output_dir, sheet_name=None, root: str = CHECKPOINT_SUBDIR):
+    """清除指定 root 的 checkpoint 檔案（預設只有主翻譯的 _checkpoint）"""
+    cd = _checkpoint_dir(output_dir, sheet_name, root)
     if cd.exists():
-        import shutil
         shutil.rmtree(cd)
+
+
+def cleanup_checkpoint(output_dir, *, reason: str, force: bool = False) -> bool:
+    """集中式清除 output_dir/_checkpoint（主翻譯 checkpoint）。
+
+    `_checkpoint/session.json` 存在代表主翻譯還在中斷狀態、part 檔是續傳的唯一來源；
+    任何非強制的清理（例如校對跑完的 generate_reports）都不可把它砍掉——
+    先前校對流程無條件 rmtree，使用者只是跑一次校對就永久丟失主翻譯進度。
+    force=True 只保留給「使用者已明確同意丟棄」的路徑。
+
+    回傳 True 表示 _checkpoint 已不存在（含本來就沒有），False 表示被進行中的
+    session 擋下、什麼都沒刪。reason 只進訊息，方便排查是誰觸發清理。
+    """
+    cp = Path(output_dir) / CHECKPOINT_SUBDIR
+    if (cp / SESSION_FILE).exists() and not force:
+        print(f"  ⚠️偵測到進行中的翻譯進度，保留 {cp}（清理原因：{reason}）")
+        return False
+    if not cp.exists():
+        return True
+    shutil.rmtree(cp)
+    print(f"  已清除翻譯 checkpoint：{cp}（清理原因：{reason}）")
+    return True
+
+
+# ── 來源指紋：確認續傳的 part 對應的是同一份原文 ──
+
+def english_fingerprint(english_values) -> str:
+    """對一連串原文值算 sha1（逐值 UTF-8，值之間補 b"\\x00" 分隔）。
+
+    補分隔符是必要的：["ab", "c"] 與 ["a", "bc"] 直接串接會得到同一個 sha1。
+    實測 103,257 列（6.73 MB）約 17.5 ms，可以放心在入口算。
+    """
+    h = hashlib.sha1()
+    for v in english_values:
+        h.update(str(v).encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def english_fingerprint_df(df) -> str:
+    """DataFrame 版的原文指紋；沒有 english 欄時回 sha1(b"")。
+
+    必須用 tolist() 取原始值再交給 english_fingerprint 的 str()：這與讀檔
+    （read_excel dtype=str）以及還原／pending 判定是同一個口徑。不可改成
+    astype(str)——pandas 3.0 上它對缺值不是單純的字串化（pd.NA／None 會被
+    併成 NaN），兩端算出的指紋就可能不一致，續傳會被誤判成來源已變更。
+    """
+    if df is None or "english" not in df.columns:
+        return hashlib.sha1(b"").hexdigest()
+    return english_fingerprint(df["english"].tolist())
+
+
+def save_source_fingerprint(output_dir, excel_path, sheets: dict[str, str]) -> None:
+    """把這次翻譯所依據的原文指紋寫進 _checkpoint/source.json（原子寫入）。
+
+    excel_path／size 只記錄、不參與判定：使用者把 Excel 另存新檔、搬到別的
+    資料夾或改檔名時，這兩個欄位一定會變，拿它們比對會把正常續傳誤判成
+    「來源已變更」而白白重翻（幾小時的 API 費用）。真正的判定依據只有
+    sheets 裡各工作表的 english sha1。
+    """
+    cp = _checkpoint_dir(output_dir)
+    cp.mkdir(parents=True, exist_ok=True)
+    path = Path(excel_path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    data = {
+        "excel_path": str(path.resolve()),
+        "size": size,
+        "sheets": dict(sheets),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+    atomic_write_text(cp / SOURCE_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def load_source_fingerprint(output_dir) -> dict | None:
+    """讀 source.json；不存在、無法解析或內容不是物件時回 None。
+
+    回 None 代表「沒有指紋可用」（舊版進度或檔案損壞），呼叫端應放行續傳，
+    不可把「讀不到」當成「來源已變更」。
+    """
+    path = _checkpoint_dir(output_dir) / SOURCE_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # ── 通用 async worker pool ──
@@ -542,8 +643,14 @@ def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None
     trans_vals = df["translation"].tolist() if "translation" in df.columns else [None] * len(df)
     notes_vals = df["notes"].tolist() if "notes" in df.columns else [None] * len(df)
     wiki_vals = df["wiki_url"].tolist() if "wiki_url" in df.columns else [None] * len(df)
+    missing_english = 0
     for idx, eng_raw, eng_val, sub_val, trans_val, notes_val, wiki_val in zip(
             df.index, english_raw, english_vals, sub_vals, trans_vals, notes_vals, wiki_vals):
+        # 原文缺值（NaN／None／空字串）沒有可翻譯的內容：送進 API 只會浪費錢，
+        # 模型還可能回傳「nan」這種假譯文；也讓 enforcer 不必再為這些列判未翻譯。
+        if _is_na(eng_raw) or not str(eng_raw).strip():
+            missing_english += 1
+            continue
         if is_missing_translation(trans_val, english=_english_hint(eng_raw)):
             pending.append({
                 "_idx": idx,
@@ -552,6 +659,8 @@ def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None
                 "notes": notes_val,
                 "wiki_url": wiki_val,
             })
+    if missing_english:
+        print(f"  跳過 {missing_english} 列原文缺值")
     if not pending:
         print("  所有条目已完成，无需翻译")
     pending.sort(key=lambda x: (x.get("sub_category", ""), x.get("_idx", 0)))

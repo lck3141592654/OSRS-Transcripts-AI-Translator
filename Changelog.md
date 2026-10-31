@@ -1,5 +1,27 @@
 # Changelog
 
+## 1/11/2026 v0.4.6 -> v0.4.7
+
+### 中文
+- **翻譯正確性**：重譯（P4a）與潤色（P3）寫回前新增回歸守門，候選不得比原本多出「未翻譯／佔位符缺失」這類致命問題，模型回吐英文不再覆蓋合法中文；候選若把原本未翻譯的列修好則放行。主翻譯 Phase B 不套用（只寫缺值列）
+- **術語與缺值**：術語庫「譯文＝原文才正確」的條目（玩家名等）不再被判未翻譯而反覆重譯（`name` 表問題列 2,937 → 2,921）；原文缺值的空白列不再送進重譯
+- **校對不再清掉主翻譯進度**：新增 `cleanup_checkpoint()`，`_checkpoint/session.json` 存在就保留；校對改用獨立的 `_proofread_checkpoint`，P3／P4a 的 part 與 `progress.json` 不再污染主翻譯續傳
+- **續傳安全**：`enforce_checkpoint.json` 記錄 `sheet` 與 `english_sha1`，別的工作表／另一份 Excel 的記錄不會再讓續傳跳輪；續傳前比對來源指紋（`source.json`），Excel 內容改過會先問「[1] 丟棄重翻 [2] 取消」
+- **全新翻譯清場**：先清掉上一輪殘留的孤兒 checkpoint（含損壞的 `session.json`），避免舊 part 被當成本次進度
+- **自訂 HTTP header**：新增選填的 `APIx_EXTRA_HEADERS`（JSON 或 `名稱: 值; …` 簡寫，支援 `<RUN_ID>`），用於 OpenCode Go 這類要求 `x-opencode-session` 與自訂 User-Agent 的供應商；載入期驗證並在啟動時印出已套用的 header 名稱（不印值）；未設定時請求內容與 v0.4.6 完全相同
+- **其他**：舊版單一 API 格式支援 `PARALLEL_LIMIT`；Ctrl+C 中斷改為一行提示並以 130 結束；術語庫「譯文＝原文」提示只印條數；`ApiConfig` 有預設值的欄位改為關鍵字限定
+- **文件**：`.env.example` 與兩版 README 同步更新
+
+### English
+- **Correctness**: retranslation (P4a) and polish (P3) writes now pass a regression gate — a candidate may not add fatal issues ("untranslated" / "missing placeholder"), so a model echoing the source can no longer overwrite valid Chinese; a candidate that fixes a previously untranslated row is still accepted. Phase B is exempt (it only writes missing rows)
+- **Glossary and missing sources**: glossary entries whose translation equals the source (player names, etc.) are no longer retried as untranslated (the `name` sheet drops from 2,937 to 2,921 problem rows); rows with no English source are no longer sent back for retranslation
+- **Proofreading no longer wipes main-translation progress**: new `cleanup_checkpoint()` keeps `_checkpoint` while `session.json` exists; proofreading now uses its own `_proofread_checkpoint`, so P3/P4a parts and `progress.json` cannot pollute the main translation's resume state
+- **Safe resume**: `enforce_checkpoint.json` records `sheet` and `english_sha1`, so leftovers from another sheet or workbook no longer skip rounds; resume compares a source fingerprint (`source.json`) and asks "[1] discard and retranslate [2] cancel" if the workbook changed
+- **Fresh runs clean up**: orphaned checkpoints from a previous run (including a corrupt `session.json`) are cleared first, so stale parts cannot be mistaken for current progress
+- **Custom HTTP headers**: new optional `APIx_EXTRA_HEADERS` (JSON or `Name: Value; ...` shorthand, `<RUN_ID>` supported) for providers such as OpenCode Go that require `x-opencode-session` and a custom User-Agent; validated at load time and the applied header names are printed at startup (names only); when unset, requests are identical to v0.4.6
+- **Misc**: the legacy single API format supports `PARALLEL_LIMIT`; Ctrl+C prints one line and exits with code 130; the "translation equals source" glossary hint prints only the count; `ApiConfig` fields with defaults are keyword-only
+- **Docs**: `.env.example` and both READMEs updated
+
 ## 20/10/2026 v0.4.5 -> v0.4.6
 
 ### 中文

@@ -10,16 +10,19 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from glossary import (load_glossary, auto_extract_glossary, find_term_spans,
-                      build_relevance_context, filter_relevant_terms, TermLookup)
+                      build_relevance_context, filter_relevant_terms, TermLookup,
+                      keep_english_terms)
 from tm_matcher import match_and_fill
 from llm_translator import (
     _group_into_batches, _sanitize_sheet_name,
     save_backup_part, sync_progress, save_progress, atomic_write_text,
     get_relevant_glossary, is_missing_translation, get_debug_message_dir,
     _english_hint, _english_hint_at, _progress_indices, load_backup,
+    PROOFREAD_CHECKPOINT_SUBDIR, cleanup_checkpoint, english_fingerprint_df,
 )
 from enforcer import (
     scan_issues, _enforce_async, narrow_relevant_glossary, _join_all_english,
+    regressed,
 )
 from api_config import (
     OVER_RETURN_TOLERANCE,
@@ -28,7 +31,7 @@ from api_config import (
 from shared_pool import SharedBatchPool
 
 # Constants
-CHECKPOINT_SUBDIR = "_proofread_checkpoint"
+CHECKPOINT_SUBDIR = PROOFREAD_CHECKPOINT_SUBDIR
 BACKUP_SUBDIR = "_proofread_backup"
 PROGRESS_FILE = "progress.json"
 SESSION_FILE = "session.json"
@@ -908,7 +911,11 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
 
     MAX_ROUNDS = 3
     lookup = TermLookup(glossary)          # P3 每個階段只建一次（0.125 秒）
-    completed_indices = _progress_indices(load_backup(output_dir, sheet_name))
+    # 守門用的「譯文＝原文才正確」術語集合（與 enforcer._fatal 同口徑）。
+    # 必須在批次函式與輪次迴圈外算一次：process_batch 是巢狀函式，靠閉包捕獲，
+    # 寫在裡面等於每一批都重掃一次術語庫（全詞庫掃描是高成本操作）。
+    keep = keep_english_terms(glossary)
+    completed_indices = _progress_indices(load_backup(output_dir, sheet_name, root=PROOFREAD_CHECKPOINT_SUBDIR))
     current_indices = sorted(all_indices)
     # 續傳：只保留「譯文仍為空」或「上一輪失敗」的條目，已潤色完成的不重送
     if start_round > 0:
@@ -935,8 +942,25 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
         tag = uuid.uuid4().hex[:8]
         all_backup = {}
         total_batches = len(batches)
+        # 守門拒絕數是本輪獨立計數：不可混進 skipped（skipped 代表「回傳無效」，
+        # 兩者的原因與後續處理完全不同，混在一起會讓使用者誤判 LLM 品質）。
+        # 宣告在輪次層級（而非 process_batch 內），才能在批次並行跑完後印「本輪」一行。
+        # 分類累計與 enforcer._retry_process 同口徑，日誌格式也一致，方便 grep。
+        guard_rejected = 0
+        guard_rejected_detail = {"untranslated": 0, "placeholder": 0}
+
+        def _report_guard_rejected(round_no):
+            """每輪印一行守門統計（契約 §2.4：獨立計數、每輪一行、不計入 skipped）。
+
+            enforce 管線每輪必印（含 0 條），P3 也用同一格式：只印 >0 的輪次會讓
+            「這輪沒擋任何候選」與「這段程式沒跑到」在日誌上無法區分。
+            """
+            print(f"  P3 第 {round_no + 1} 轮：本輪守門拒絕 {guard_rejected} 條"
+                  f"（未翻譯 {guard_rejected_detail['untranslated']}、"
+                  f"佔位符 {guard_rejected_detail['placeholder']}）")
 
         async def process_batch(ws, job):
+            nonlocal guard_rejected
             cfg = ws["cfg"]
             bn, batch = job.batch_num, job.batch
             _timestamp(f"P3 批次 {bn}/{total_batches} 开始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
@@ -960,6 +984,18 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
                             skipped += 1
                             continue
                         if idx in df.index:
+                            # 逐候選回歸守門（契約 §3.1 逐字）：潤色只能「修好」，不可讓
+                            # 候選比原譯文多出致命問題（未翻譯／佔位符）。被拒絕的列保留
+                            # 原譯文，下一輪仍會因為譯文為空或列進 failed 而重送。
+                            previous = df.at[idx, "translation"]
+                            eng_raw = df.at[idx, "english"] if "english" in df.columns else None
+                            reason = regressed(eng_raw, previous, trans, keep)
+                            if reason:
+                                guard_rejected += 1
+                                for _label in ("untranslated", "placeholder"):
+                                    if _label in reason:
+                                        guard_rejected_detail[_label] += 1
+                                continue
                             df.at[idx, "translation"] = trans
                             new_backup[str(idx)] = str(trans)
                             all_backup[str(idx)] = str(trans)
@@ -973,13 +1009,16 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
                 if new_backup:
                     # ⚠️ P3 的變數名是 tag / bn，不是 llm_translator 版的 session_tag / batch_num。
                     # 直接照抄上面 (a) 的程式碼會在 save_backup_part 就直接 NameError。
-                    save_backup_part(output_dir, tag, bn, new_backup, sheet_name)
+                    # root 一定要帶：校對產物寫進自己的目錄，否則會污染主翻譯的續傳進度
+                    save_backup_part(output_dir, tag, bn, new_backup, sheet_name,
+                                     root=PROOFREAD_CHECKPOINT_SUBDIR)
                     for k in new_backup:
                         try:
                             completed_indices.append(int(k))
                         except (TypeError, ValueError):
                             continue
-                    save_progress(output_dir, sorted(set(completed_indices)), sheet_name)
+                    save_progress(output_dir, sorted(set(completed_indices)), sheet_name,
+                                  root=PROOFREAD_CHECKPOINT_SUBDIR)
                 _timestamp(f"P3 批次 {bn}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
             except Exception as e:
                 if is_rate_limit_error(e):
@@ -1007,15 +1046,17 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
                 if all_backup:
                     partial_failed = sorted(idx for idx in current_indices if str(idx) not in all_backup)
                     _save_polish_checkpoint(output_dir, sheet_name, all_backup, rnd - 1, failed_indices=partial_failed)
-                    sync_progress(output_dir, sheet_name)
+                    sync_progress(output_dir, sheet_name, root=PROOFREAD_CHECKPOINT_SUBDIR)
+                _report_guard_rejected(rnd)
                 print(f"  P3 完成（部分）：已储存 {len(all_backup)} 条结果")
                 return df
             raise
 
+        _report_guard_rejected(rnd)
         failed = sorted(idx for idx in current_indices if str(idx) not in all_backup)
         if all_backup or failed:
             _save_polish_checkpoint(output_dir, sheet_name, all_backup, rnd, failed_indices=failed)
-            sync_progress(output_dir, sheet_name)
+            sync_progress(output_dir, sheet_name, root=PROOFREAD_CHECKPOINT_SUBDIR)
 
         _timestamp(f"P3 第 {rnd + 1} 轮：{len(all_backup)} 条已润色")
 
@@ -1081,7 +1122,10 @@ async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     relevant_glossary = narrow_relevant_glossary(df, relevant_glossary)
     # Run retry directly in current event loop with the shared pool
     if pool is not None:
-        df = await _enforce_async(df, relevant_glossary, output_dir=output_dir, sheet_name=sheet_name, shared_pool=pool)
+        # checkpoint_root 由呼叫端決定：P4a 的 part 與 enforce_checkpoint.json
+        # 都必須留在校對自己的目錄，否則會污染主翻譯的續傳進度
+        df = await _enforce_async(df, relevant_glossary, output_dir=output_dir, sheet_name=sheet_name,
+                                  shared_pool=pool, checkpoint_root=PROOFREAD_CHECKPOINT_SUBDIR)
     # Final scan (same as enforcer.enforce())
     lookup = TermLookup(relevant_glossary)
     final_pool = scan_issues(df, relevant_glossary, lookup)
@@ -1249,10 +1293,11 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
     if cp_dir.exists():
         import shutil; shutil.rmtree(cp_dir)
         print(f"  已清除校對 checkpoint")
-    ecp = Path(output_dir) / "_checkpoint"
-    if ecp.exists():
-        import shutil; shutil.rmtree(ecp)
-        print(f"  已清除強制檢查 checkpoint")
+    # 不可無條件 rmtree("_checkpoint")：校對與主翻譯是兩條獨立管線，
+    # 使用者的主翻譯可能正處於中斷續傳狀態（_checkpoint/session.json + 數百個 part），
+    # 跑一次校對就把它砍掉等於續傳進度全毀。交給 cleanup_checkpoint 判定：
+    # 有 session.json 就保留不動。
+    cleanup_checkpoint(output_dir, reason="proofread_done")
     elapsed(overall_start, "總計")
 
 
@@ -1452,7 +1497,9 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
             if review_df is not None and not review_df.empty:
                 review_df.insert(0, "sheet_name", sheet_name)
                 all_review_rows.append(review_df)
-            ecp = Path(str(workplace)) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
+            # enforce_checkpoint.json 跟著 P4a 的 part 一起搬進校對目錄，
+            # 刪除時也必須指同一個目錄，否則會殘留標記讓下次續傳跳過第 1 輪
+            ecp = Path(str(workplace)) / PROOFREAD_CHECKPOINT_SUBDIR / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
             if ecp.exists():
                 ecp.unlink()
             st["df_original"].update(df)
@@ -1564,15 +1611,38 @@ def _is_quick_sheet_complete(output_dir, sheet_name) -> bool:
 
 def _restore_enforce_backup(df, output_dir, sheet_name) -> int:
     """把重譯（enforce）備份套回 df，僅在重譯確實被中斷時還原（依 enforce_tag 過濾 part）。"""
-    cp = Path(output_dir) / "_checkpoint" / _sanitize_sheet_name(sheet_name)
+    # P4a 的 part 與 enforce_checkpoint.json 都在校對目錄（_proofread_checkpoint），
+    # 不是主翻譯的 _checkpoint。讀錯目錄會讓續傳「靜默還原 0 條」——
+    # 接著 _enforce_async 依 enforce_checkpoint.json 的 completed_rounds 直接從第 2 輪起跑，
+    # 第 1 輪的修正全部消失，且沒有任何錯誤訊息。
+    cp = Path(output_dir) / PROOFREAD_CHECKPOINT_SUBDIR / _sanitize_sheet_name(sheet_name)
     ecp = cp / "enforce_checkpoint.json"
     if not ecp.exists():
         return 0
+    # 來源守門（與 enforcer._enforce_async 讀 checkpoint 的口徑一致）：
+    # 只憑 enforce_tag 就合併 part，會把「另一份 Excel／另一張表／改過的原文」的
+    # 譯文鋪到本表同一個列號上。這些列已有譯文，scan_issues 不會標記、也不會
+    # 進 pending，下一輪救不回來——是靜默錯譯，所以寧可整份忽略。
+    # 舊格式 checkpoint 沒有 sheet 欄 → cp_data.get("sheet") != sheet_name 成立
+    # → 一律忽略（保守，與 _enforce_async 對舊格式的處理一致）。
     try:
-        enforce_tag = json.loads(ecp.read_text(encoding="utf-8")).get("enforce_tag")
+        cp_data = json.loads(ecp.read_text(encoding="utf-8"))
     except Exception:
-        enforce_tag = None
+        return 0
+    # 合法 JSON 但不是物件（[]／null／"x"／123）→ 視同損壞。
+    # 舊寫法把 .get() 放在 try 外，遇到這種內容會 AttributeError 讓整趟校對中止；
+    # main 版（json.loads(...).get(...) 全包在 try 內）是安全回 0，這裡必須一致。
+    if not isinstance(cp_data, dict):
+        return 0
+    enforce_tag = cp_data.get("enforce_tag")
     if not enforce_tag:
+        return 0
+    want = cp_data.get("english_sha1")
+    # 指紋必須存在且相符：只驗 sheet 不夠——同一張表換了原文（改列／換檔）時
+    # sheet 仍然相同，缺指紋就不能證明 part 對得上，寧可整份忽略。
+    if cp_data.get("sheet") != sheet_name or not want or want != english_fingerprint_df(df):
+        print("    警告：重譯備份記錄的工作表或原文指紋與目前資料不符，忽略這份備份"
+              "（避免把別的檔案／變更後的譯文鋪到本表）")
         return 0
     backup = {}
     for f in sorted(cp.glob(f"part_{enforce_tag}_*.json")):
@@ -1662,11 +1732,9 @@ def generate_quick_reports(excel_path, all_translated_dfs, all_review_rows: list
         import shutil
         shutil.rmtree(qcp)
         print(f"  已清除快速校對 checkpoint")
-    ecp = Path(output_dir) / "_checkpoint"
-    if ecp.exists():
-        import shutil
-        shutil.rmtree(ecp)
-        print(f"  已清除強制檢查 checkpoint")
+    # 同 generate_reports：_checkpoint 屬於主翻譯，快速校對結束不可無條件清掉，
+    # 否則中斷中的主翻譯續傳進度會被一次校對整個砍掉
+    cleanup_checkpoint(output_dir, reason="proofread_done")
     elapsed(overall_start, "總計")
 
 
@@ -1787,7 +1855,7 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
             if review_df is not None and not review_df.empty:
                 review_df.insert(0, "sheet_name", sheet_name)
                 all_review_rows.append(review_df)
-            ecp = Path(str(workplace)) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
+            ecp = Path(str(workplace)) / PROOFREAD_CHECKPOINT_SUBDIR / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
             if ecp.exists():
                 ecp.unlink()
             st["df_original"].update(df)

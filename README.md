@@ -11,14 +11,12 @@
 這是一套專為大規模遊戲文本翻譯設計的 AI 自動化管線。腳本目錄可任意放置，無需特定專案結構。
 > ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
 
-## 最近更新 v0.4.6 (20/10/2026)，更新詳情請看 [Changelog](Changelog.md)
-- **術語掃描大幅加速**：新增 TL4 候選索引（純英文術語用倒排索引、含標點或數字的術語用 3-gram 索引），`narrow_relevant_glossary` 冷啟動由 14–16 秒降至 0.42–0.48 秒、`scan_issues` 3,000 列 0.21 秒；主翻譯、重譯、P2 評估、P3 潤色共用同一份索引，不再逐批重建
-- **提示詞更精簡**：主翻譯只送 `index` 與 `english`，移除 `notes`、`wiki_url` 與「譯文相同請回傳空字串」的要求；同批次 payload 由 16,564 降至 7,253 字元（−56%）
-- **續傳與 I/O 優化**：`progress.json` 改為增量維護（每張工作表只掃一次 checkpoint 目錄）、翻譯與 P3 每批完成即落盤；全新翻譯路徑的 Excel 只讀一次；`iterrows` 熱點向量化；審查報告改在寫入時直接上色
-- **逾時與 429**：LLM client 改用分項逾時（connect 60／read 1,800／write 300／pool 300 秒）並關閉 SDK 重試，移除四個呼叫點的 per-request `timeout=` 覆蓋；並行請求同時 429 時，冷卻中的重複 429 不再重複累計 strike
-- **主 API 並發預設改為 100**：`MAIN_DEFAULT_LIMIT` 由 10 調整為 100；沒有在 `.env` 設定 `APIx_PARALLEL_LIMIT` 的主 API 現在預設用 100（若遇到 429 請調降並發）
-- **其他**：移除 `enforcer.py`／`llm_translator.py`／`proofreader.py` 未使用的 `API_TIMEOUT` import
-- **簡化**README.md、README_en.md的內容
+## 最近更新 v0.4.7 (1/11/2026)，更新詳情請看 [Changelog](Changelog.md)
+- **翻譯正確性**：重譯／潤色寫回新增回歸守門，模型回吐英文不再覆蓋合法中文；術語庫「譯文＝原文」的條目（玩家名等）不再被判未翻譯；原文缺值的空白列不再送進重譯
+- **續傳安全**：校對改用獨立的 `_proofread_checkpoint`，主翻譯中斷時進度不再被校對清掉；續傳前會比對來源指紋，Excel 內容改過會先問「丟棄重翻／取消」
+- **自訂 HTTP header**：新增選填的 `APIx_EXTRA_HEADERS`（JSON 或 `名稱: 值; …` 簡寫），用於 **OpenCode Go** 這類要求 `x-opencode-session` 與自訂 User-Agent 的供應商；未設定時請求內容與上一版完全相同
+- **其他**：Ctrl+C 中斷改為一行提示（退出碼 130）；舊版單一 API 格式支援 `PARALLEL_LIMIT`
+- 上一版 v0.4.6 的重點（術語掃描大幅加速、主 API 並發預設 100、分項逾時等）仍適用，詳見 Changelog
 
 ### 特色
 
@@ -71,20 +69,26 @@ pip install openpyxl pandas openai python-dotenv json-repair
 - 本工具支援任何 **OpenAI 相容 API**，推薦使用[DeepSeek 官方](https://platform.deepseek.com/)的deepseek-flash模型
 - 複製 `.env.example` 為 `.env`，填入你的設定。支援兩種格式，以下為範本：
 
+### 選填：自訂 HTTP header（部分供應商要求）
+- 少數供應商要求每個請求帶特定 header。例如 **OpenCode Go** 要求 `x-opencode-session`（固定不變的 session id）並建議自訂 User-Agent。在對應的 API 加上 `APIx_EXTRA_HEADERS`：
+- 兩個"osrs-translator"的值都可以自己填，但只能是 ASCII，且不要含 `;`（含 `;` 請改用 JSON 寫法）
+- 舊版單一 API 格式用 `EXTRA_HEADERS=...`；未設定時請求與舊版完全相同
+
 ### 多 API 格式（可選）
 
 ```env
 # 主 API（預設並發=100）
 API1_TYPE=main
-# API1_PARALLEL_LIMIT=100   <- 選填：取消註解即可自訂並發數
+# API1_PARALLEL_LIMIT=100  # 選填：取消註解即可自訂並發數
 API1_MODEL_PROVIDER=Deepseek
 API1_MODEL=deepseek-flash
 API1_API_KEY=sk-your_api_key_here
 API1_BASE_URL=https://api.deepseek.com/
+# API1_EXTRA_HEADERS=x-opencode-session: osrs-translator; User-Agent: osrs-translator  # 選填：取消註解即可啟用
 
 # 副 API（預設並發=1，建議用作免費API）
 API2_TYPE=fallback
-# API2_PARALLEL_LIMIT=1    <- 選填：取消註解即可自訂並發數
+# API2_PARALLEL_LIMIT=1  # 選填：取消註解即可自訂並發數
 API2_MODEL_PROVIDER=nvidia
 API2_MODEL=deepseek-ai/deepseek-v4-flash
 API2_API_KEY=nvapi-your_free_key_here
@@ -96,8 +100,10 @@ API2_BASE_URL=https://integrate.api.nvidia.com/v1
 API_KEY=sk-your_api_key_here
 MODEL_PROVIDER=Deepseek
 MODEL=deepseek-flash
+# PARALLEL_LIMIT=100  # 選填：取消註解即可自訂並發數
 BASE_URL=https://api.deepseek.com/
 ```
+
 ---
 
 ## 使用方法

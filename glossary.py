@@ -621,7 +621,48 @@ def load_glossary(
         if normalize_term(k) not in ignore_norm_set
     }
 
+    # 譯文＝原文的條目會被 keep_english_terms() 當成「保留原文才正確」而豁免
+    # 未翻譯檢查（R1 建議）：印一行讓使用者知道那是刻意的（玩家名／品牌名），
+    # 不是漏翻——不逐一列出，前面這個數字提示就夠了（使用者要求）。
+    # 其餘細節留給 keep_english_terms() 的 docstring，需要時再查。
+    in_place = [k for k, v in glossary.items() if isinstance(v, str) and v.strip().lower() == str(k).strip().lower()]
+    if in_place:
+        print(f"  提示：術語庫有 {len(in_place)} 條「譯文＝原文」，保留原文不算未翻譯")
+
     return glossary
+
+def keep_english_terms(glossary: dict[str, str] | None = None) -> frozenset[str]:
+    """回傳「譯文＝原文才正確」的術語集合（全部小寫）。
+
+    = ADD_LIST 中 translation == english 的 key
+      ∪ glossary 中 translation == english 的 key（字串本身，不做 normalize）
+    實測 load_glossary() 後共 20 條（16 個玩家名 + 4 條 ADD_LIST）。
+
+    用途：玩家名、OSRS／RuneLite 這類品牌名的譯文本來就該與原文相同，
+    `check_untranslated` 要把這種「譯文＝原文」視為正確行為，否則它們會
+    永遠被判成「未實際翻譯」而反覆送進重譯（R1 懷疑點 8 實測 name 表
+    2,937 → 2,921 列，消失的正好是 16 列玩家名）。
+
+    刻意不做 normalize_term：術語庫的玩家名都是單一字詞，歸一化會剝掉
+    複數後綴，反而讓 Hosidius／Hosidiu 這類不同術語混成同一個鍵。
+
+    回傳 frozenset：這份集合會被逐列比對、只讀不寫（避免呼叫端誤改共用集合），
+    且比 list 的成員查詢便宜。
+    """
+    keep: set[str] = set()
+    # ADD_LIST 一律納入：它不隨載入的術語庫而變，即使呼叫端傳入收斂後的
+    # relevant_glossary（narrow_relevant_glossary 可能把未命中的品牌名濾掉），
+    # 這些條目仍必須保持豁免。
+    for source in (ADD_LIST, glossary or {}):
+        for k, v in source.items():
+            # 值不是字串就跳過：術語庫可能被人手動填了數字、空值或 pd.NA
+            if not isinstance(v, str):
+                continue
+            key = str(k).strip().lower()
+            if key and key == v.strip().lower():
+                keep.add(key)
+    return frozenset(keep)
+
 
 def auto_extract_glossary(
     target_excel_path: str | Path,

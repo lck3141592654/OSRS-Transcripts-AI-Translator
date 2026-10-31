@@ -73,11 +73,18 @@ class SharedBatchPool:
         if not active:
             raise RuntimeError("no available API")
         for cfg in active:
+            if cfg.extra_headers:
+                # 只印名稱、不印值：值可能是 session id 或 token
+                print(f"    {cfg.api_id} 已套用自訂 header：{'、'.join(cfg.extra_headers)}")
             self._worker_states.append({
                 "cfg": cfg,
                 "client": AsyncOpenAI(
                     api_key=cfg.key,
                     base_url=cfg.base_url,
+                    # 自訂 header（例如 OpenCode Go 的 x-opencode-session）。
+                    # 必須傳副本：SDK 對 default_headers 是按參考持有，
+                    # 共用 dict 的話之後任何就地修改都會影響已建立的 client。
+                    default_headers=dict(cfg.extra_headers) or None,
                     # 關閉 SDK 內建重試：程式自己已有 3 次重試迴圈，
                     # 兩者相乘會讓單一批次的最壞嘗試次數變成 9 次。
                     max_retries=0,

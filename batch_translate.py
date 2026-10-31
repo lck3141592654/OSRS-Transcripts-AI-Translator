@@ -12,6 +12,8 @@ from glossary import load_glossary
 from tm_matcher import match_and_fill
 from llm_translator import prepare_sheet_translation, translate_sheet_phase, is_missing_translation
 from llm_translator import save_session, delete_checkpoint_files, load_backup, get_debug_message_dir
+from llm_translator import (load_source_fingerprint, save_source_fingerprint,
+                            english_fingerprint_df, cleanup_checkpoint)
 from enforcer import enforce_async
 from shared_pool import SharedBatchPool
 
@@ -308,6 +310,124 @@ def prompt_resume(session: dict) -> bool:
     print(SEP)
     return input("\n繼續翻譯？(Y/n): ").strip().lower() != "n"
 
+
+def _source_fingerprint_mismatch(source, fp: dict) -> tuple[list[str], list[str]]:
+    """比對來源指紋，回傳 (不符的工作表, 每一筆的說明)。
+
+    純比對、不互動，方便測試呼叫。讀法一定要與寫指紋時同口徑
+    （`dtype=str` + `usecols=["english"]`），否則同一份檔也會算出不同的 sha1。
+
+    `source` 可以是路徑（Path／str），也可以是已開啟的 `pd.ExcelFile`：
+    `_preflight_source_check` 用後者共用同一個 workbook 控制代碼（10 張表 25 秒
+    → 6.6 秒），既有測試與其他呼叫端傳路徑。`Path` 分支保留是為了相容性。
+
+    指紋格式異常（`sheets` 不是 dict）→ 回 ([], [])，視為沒有指紋可判定，
+    不可讓 `.items()` 拋 AttributeError（覆檢 §1.8／§2.3）。
+    單張表讀檔失敗（工作表被刪、權限不足、欄位缺失）一律當作「不符」處理：
+    這種情況下舊進度的列對應關係一樣不可信，但不可讓例外炸掉呼叫端的選單。
+    """
+    sheets = fp.get("sheets") if isinstance(fp, dict) else None
+    if not isinstance(sheets, dict):
+        return [], []
+    mismatch: list[str] = []
+    reasons: list[str] = []
+    for sn, want in sheets.items():
+        try:
+            if isinstance(source, pd.ExcelFile):
+                df_en = source.parse(sn, dtype=str, usecols=["english"])
+            else:
+                df_en = pd.read_excel(source, sheet_name=sn, dtype=str, usecols=["english"])
+        except Exception as e:
+            mismatch.append(sn)
+            reasons.append(f"{sn}: 讀不到工作表（{type(e).__name__}）")
+            continue
+        if english_fingerprint_df(df_en) != want:
+            mismatch.append(sn)
+            reasons.append(f"{sn}: english 欄內容已變更")
+    return mismatch, reasons
+
+
+def _preflight_source_check(workplace: Path, excel_path: Path, session: dict) -> bool:
+    """續傳前的來源指紋 pre-flight。
+
+    必須在 `prompt_resume()` **之前**跑：指紋不符若等到使用者按下「繼續」才發現，
+    等於讓人白按一次、甚至白跑一輪才被退回（R2 風險 2-8）。
+
+    判定順序是「先診斷檔案可用性，再做指紋比對」：檔案被改名／搬走／損壞時
+    讀不到，但**內容並沒有變更**，這種情況不可歸類成「來源已變更」而提供
+    `[1] 丟棄重翻`——使用者照著提示按 1 就會把幾小時的進度刪光（覆檢 §1.3(b)）。
+    讀不到一律取消，且不提供任何刪除選項。
+
+    回傳 False = 使用者取消（或來源檔不可用），呼叫端直接結束、舊進度原封不動。
+    回傳 True 時有三種結果：
+      - 沒有指紋／指紋格式異常（舊 session、損壞的 source.json）→ 放行續傳；
+      - 指紋相符 → session 不動，照原流程續傳；
+      - 指紋不符且使用者選 [1] 丟棄重翻 → 本函式已刪掉 _checkpoint 並清空 session，
+        呼叫端自然落到全新翻譯路徑。
+    """
+    excel_path = Path(excel_path)
+    # 來源檔不在原位時，續傳一定做不到（後面會 read_excel）。先講清楚再退出，
+    # 不要讓使用者在 prompt_resume 按了「繼續」之後才吃到 FileNotFoundError。
+    # 這段放在「有沒有指紋」之前：舊 session 沒有 source.json 也適用。
+    if not excel_path.exists():
+        print(f"\n  ⚠️ 找不到來源檔：{excel_path}")
+        print("     進度都還在。請把檔案放回原位（或改回原檔名）後重新執行；")
+        print("     若你要翻譯的是另一份檔案，請先自行備份後刪除 _checkpoint/session.json。")
+        return False
+
+    # ── 先診斷「檔案可用性」，再做指紋比對 ──
+    # 開檔要放在「沒有指紋就放行」之前：舊 session（沒有 source.json）遇到損壞的
+    # Excel 時，若在這裡放行，使用者按了「繼續」之後才會吃到 ValueError + traceback。
+    try:
+        xls_ctx = pd.ExcelFile(excel_path)
+    except Exception as e:
+        print(f"\n  ⚠️ 來源檔無法開啟（{type(e).__name__}）：{excel_path}")
+        print("     進度都還在。請確認檔案沒有損壞或被其他程式鎖住後重新執行。")
+        return False
+
+    try:
+        fp = load_source_fingerprint(workplace)
+        sheets = fp.get("sheets") if isinstance(fp, dict) else None
+        if not isinstance(sheets, dict) or not sheets:
+            # 沒有指紋（舊版 session）或指紋格式異常（sheets 被手動改成 list／str）：
+            # 視為沒有指紋可判定，寧可放行也不要誤殺正常續傳。
+            return True
+
+        # 共用同一個 ExcelFile 控制代碼逐表 parse：每張表重新 pd.read_excel 會把
+        # sharedStrings 重複解析（實測 10 張表 25 秒 vs 6.6 秒）。先印一行，避免
+        # 大檔比對期間畫面完全空白被誤認為當機（覆檢 §1.9）。
+        print(f"  正在比對 {len(sheets)} 張工作表的來源指紋…", flush=True)
+        mismatch, reasons = _source_fingerprint_mismatch(xls_ctx, fp)
+    finally:
+        xls_ctx.close()
+
+    if not mismatch:
+        # excel_path / size 只寫進 source.json 供排查，不參與判定
+        # （另存新檔、改檔名、Excel 存一次都會動到它們）。
+        return True
+
+    print(f"\n{SEP}")
+    print("  ⚠️ 來源 Excel 與上次不同，舊進度對不上目前的來源檔")
+    print(SEP)
+    print(f"  來源檔: {excel_path}")
+    print(f"  指紋不符的工作表（{len(mismatch)} 張）: {', '.join(mismatch)}")
+    for line in reasons:
+        print(f"    - {line}")
+    print("\n  來源檔已變更，舊進度不可用（硬套會把譯文鋪到錯誤的列上）。")
+    # [1] 刪的是整個 _checkpoint，不只上面那幾張表；先說清楚才不會誤按（覆檢 §2.5）。
+    print(f"  這會丟棄全部 {len(sheets)} 張工作表的進度，不只上面列出的 {len(mismatch)} 張。")
+    ans = input("[1] 丟棄重翻 [2] 取消：").strip()
+    if ans != "1":
+        print("\n  已取消，舊進度原封不動保留。")
+        return False
+
+    delete_checkpoint_files(str(workplace))
+    # 清空 session 讓呼叫端落到全新翻譯路徑，不必再回頭判斷「剛剛做了什麼」
+    session.clear()
+    print("\n  已丟棄舊進度，改為全新翻譯。\n")
+    return True
+
+
 def _build_session_data(excel_path, glossary_path, glossary_sheets,
                         current_sheet, completed_sheets, pending_sheets, sheet_configs,
                         accumulated_review_rows=None):
@@ -524,17 +644,30 @@ async def main():
     # ── 續傳檢測 ──
     exist_session = find_existing_progress()
     if exist_session:
+        # 進度檔可能是人手改壞或寫到一半：缺 excel_path 時不可直接索引，
+        # 否則使用者只會看到 `發生錯誤: 'excel_path'` 與 traceback（覆檢 §1.8）。
+        session_excel = exist_session.get("excel_path") if isinstance(exist_session, dict) else None
+        if not isinstance(session_excel, str) or not session_excel:
+            print("\n  ⚠️ 進度檔缺少來源路徑，可能已損壞。")
+            print("     請備份 _checkpoint/session.json 後刪除它，再重新執行。")
+            return
+        # 來源指紋 pre-flight：一定要在 prompt_resume() 之前判定。
+        # 指紋不符且使用者選 [1] 時，_preflight_source_check 會刪掉 _checkpoint
+        # 並清空 exist_session，這裡就自然落到下方的全新翻譯路徑。
+        excel_path = Path(session_excel)
+        workplace = _get_workplace()
+        if not _preflight_source_check(workplace, excel_path, exist_session):
+            return
+    # exist_session 被 pre-flight 清空＝舊進度已丟棄，走全新翻譯
+    if exist_session:
         if not prompt_resume(exist_session):
-            workplace = _get_workplace()
             delete_checkpoint_files(str(workplace))
             print("\n  已清除舊進度，開始新的翻譯。\n")
         else:
             # 解析 session（相容新舊格式）
-            excel_path = Path(exist_session["excel_path"])
             glossary_path_str = exist_session.get("glossary_path")
             glossary_path = Path(glossary_path_str) if glossary_path_str else None
             glossary_sheets = exist_session.get("glossary_sheets")
-            workplace = _get_workplace()
 
             if "current_sheet" in exist_session:
                 # 新版多工作表格式
@@ -665,6 +798,23 @@ async def main():
         input("\n按 Enter 關閉...")
         return
 
+    # 全新翻譯：先清掉上一輪留下的 checkpoint（可能是校對寫進來的孤兒 part）。
+    # 必須在 save_session 之前呼叫，否則 cleanup_checkpoint 看到剛寫入的
+    # session.json 會判定「有進行中的翻譯」而拒絕清除，舊孤兒 part 就會被
+    # load_backup 合併進來（R2 風險 2-3）。
+    # force=True 的理由：全新路徑只會在「沒有可用 session」（find_existing_progress
+    # 回 None，含 session.json 已損壞／壞 JSON）或「使用者已明確丟棄」時到達，
+    # 此時目錄裡的東西按定義不是進行中的合法進度。session.json 可能已損壞而仍
+    # 存在，非強制的 cleanup 會因「檔案存在」拒絕清除，舊 part 就被
+    # prepare_sheet_translation 當成本次進度還原（覆檢 §2.1）。
+    cleanup_checkpoint(workplace, reason="fresh_run", force=True)
+
+    # 記下來源指紋：之後的續傳靠它判斷「來源 Excel 還是不是同一份」。
+    # 這裡直接吃上面已載入的 cached_dfs，不再重讀工作簿（R2 實測每張表重讀 +5 秒）；
+    # 兩條讀法算出的 sha1 等價，由 tests/test_fingerprint.py 的 A12 釘住。
+    save_source_fingerprint(workplace, excel_path,
+                            {sn: english_fingerprint_df(cached_dfs[sn]) for sn in sheet_names})
+
     # 儲存初始 session（多工作表格式）
     pending_sheets = list(sheet_names)
     save_session(str(workplace), _build_session_data(
@@ -689,6 +839,14 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        # Ctrl+C：asyncio.run 會先取消主 task（CancelledError）再把它轉成
+        # KeyboardInterrupt 往上拋。不接住的話使用者會看到兩段 traceback
+        # （CancelledError → KeyboardInterrupt）與 Windows 的 0xC000013A
+        # 退出碼，誤以為程式壞了——其實 translate_sheet_phase 已 sync_progress、
+        # 每批的 part 也都落地，重新執行就能續傳。
+        print("\n\n  ⏹️ 已中斷：已完成批次的進度已保存，重新執行即可續傳。")
+        sys.exit(130)
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
             print("\n  ⚠️ 所有 API 已永久停用（累計 429 限流達門檻；只有一個可用 API 時門檻會放寬），無法繼續。")

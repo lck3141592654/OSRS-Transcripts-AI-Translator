@@ -4,9 +4,11 @@
 以及類別級預設並發與個別覆蓋。
 """
 
+import json
 import os
 import re
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -238,14 +240,23 @@ class ApiConfig:
     api_type: str       # "main" | "fallback"
     parallel_limit: int # 最終解析後的並發上限
 
-    # 運行時狀態（不從 .env 讀取）
-    strike: int = 0
-    cooldown_until: float = 0.0
+    # .env 的 APIx_EXTRA_HEADERS／EXTRA_HEADERS 解析結果，每個請求都會帶上。
+    # 空 dict ＝ 不帶任何自訂 header（請求內容與改動前完全相同）。
+    # repr=False：避免未來有人 print(cfg) 時把 header 值（可能是 session／token）印出來。
+    # kw_only=True：欄位插在中間，若有人用位置參數建構 ApiConfig 會靜默錯位；
+    # 本類別所有「有預設值」的欄位都是關鍵字限定，位置參數會直接 TypeError。
+    extra_headers: dict = field(default_factory=dict, repr=False, kw_only=True)
+
+    # 運行時狀態（不從 .env 讀取）。與 extra_headers 一樣全部關鍵字限定：
+    # 這個類別的欄位順序一旦被誤用成位置參數就會靜默錯位，關鍵字限定能讓
+    # 那種寫法直接 TypeError（目前兩處建構都是全關鍵字）。
+    strike: int = field(default=0, kw_only=True)
+    cooldown_until: float = field(default=0.0, kw_only=True)
     # 使用者／載入時決定的門檻；池中只有一個可用 API 時 disable_after 會被暫時放寬，
     # base_disable_after 保留原值，讓放寬可逆（見 shared_pool._relax_single_api_threshold）
-    base_disable_after: int = PERMANENT_DISABLE_AFTER
+    base_disable_after: int = field(default=PERMANENT_DISABLE_AFTER, kw_only=True)
     # 累計幾次 429 後永久停用；池中只有一個可用 API 時會被放寬（見 shared_pool）
-    disable_after: int = PERMANENT_DISABLE_AFTER
+    disable_after: int = field(default=PERMANENT_DISABLE_AFTER, kw_only=True)
 
     @property
     def is_cooling_down(self) -> bool:
@@ -278,8 +289,160 @@ class ApiConfig:
         return not self.is_cooling_down and not self.is_permanently_disabled
 
 
+# ── 自訂 HTTP header（APIx_EXTRA_HEADERS） ──────────────────────────
+# 部分供應商要求特定 header 才給用，例如 OpenCode Go：
+#   - 每個請求帶 x-opencode-session: <穩定的 session id>（路由與 prompt caching）
+#   - 建議用自己的 User-Agent，而不是 SDK／HTTP 函式庫的預設名稱
+# 兩種寫法都支援：
+#   JSON： {"x-opencode-session": "osrs-translator", "User-Agent": "osrs-translator/1.0"}
+#   簡寫： x-opencode-session: osrs-translator; User-Agent: osrs-translator/1.0
+# 值可用 <RUN_ID>：展開成「每次啟動腳本（一個 process）一個 UUID」。
+#
+# 為何是 import 期產生一次，而不是每次呼叫 load_api_configs() 產生：
+# SharedBatchPool 每建一個池就呼叫一次 load_api_configs()，一次執行最多 4 次
+# （主翻譯、校對、enforcer 臨時池…），若在函式內生成，同一次執行會出現多個
+# 不同的 session id，供應商端的路由／prompt caching 就會被打散。
+_RUN_ID = uuid.uuid4().hex
+_RUN_ID_TOKEN = "<RUN_ID>"
+
+# RFC 7230 token：header 名稱只允許這些字元（空白、冒號、非 ASCII 一律不合法）
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+# RFC 7230 field-value 只允許可見 ASCII 與 HTAB。h11 另外拒絕 \x00/\x0b/\x0c，
+# 若放行，載入期看起來正常、送出時卻變成 APIConnectionError: Connection error.，
+# 錯誤訊息完全指不到 header。
+_HEADER_VALUE_BAD_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+# 不可覆寫的 header：會破壞 SDK 認證或 HTTP 語意（Authorization 會靜默取代 api_key），
+# 或是本來就不該由用戶端指定的欄位（例如用 X-Forwarded-For 偽造來源）。
+_BLOCKED_HEADERS = frozenset({
+    "authorization", "content-type", "content-length", "host",
+    "connection", "transfer-encoding", "content-encoding",
+    "proxy-authorization", "x-forwarded-for", "forwarded",
+})
+
+# x-stainless-* 是 openai SDK 的內部標記，覆寫沒有意義且可能弄壞請求
+_BLOCKED_HEADER_PREFIXES = ("x-stainless-",)
+
+# SDK 自己會送的 header：名稱必須用它的寫法。HTTP header 名稱不分大小寫，但 SDK
+# 用大小寫敏感的 dict 合併，所以寫 user-agent（小寫）會變成「兩條並存」，
+# 伺服器通常取第一條 → 自訂值等於沒生效（實測得知）。
+_CANONICAL_HEADER_NAMES = {"user-agent": "User-Agent", "accept": "Accept"}
+
+# 允許但提醒：OpenCode Go 明確要求「用自己的 User-Agent，不要用通用 SDK 名稱」，
+# 所以不可把 User-Agent 列進黑名單，只在套用時印一行提示。
+_NOTED_HEADERS = frozenset({"user-agent"})
+
+
+def parse_extra_headers(spec: str) -> dict[str, str]:
+    """解析 APIx_EXTRA_HEADERS 的字串（純函式，不讀環境變數）。
+
+    兩種寫法：
+      JSON：  {"x-opencode-session": "abc", "User-Agent": "my-agent/1.0"}
+      簡寫：  名稱: 值; 名稱2: 值2（只用第一個冒號切分，值內可含 "https://" 這種冒號）
+
+    錯誤處理：
+      - 單筆 header 有問題（名稱不合法／空值／非 ASCII／控制字元／被擋）→ 只忽略該筆；
+      - 簡寫某一段缺少冒號 → 只忽略該段（值含 ";" 時請改用 JSON）；
+      - 整串 JSON 解析失敗 → 放棄全部並回傳空 dict。
+    任何情況都不會讓呼叫端例外，也不會讓整個 API 從並發池消失。
+    """
+    text = (spec or "").strip()
+    if not text:
+        return {}
+
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except Exception as e:
+            print(f"  警告：自訂 header 的 JSON 解析失敗（{type(e).__name__}），此 API 將不帶自訂 header")
+            return {}
+        raw_pairs = list(data.items())
+    else:
+        raw_pairs = []
+        for chunk in text.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            name, sep, value = chunk.partition(":")
+            if not sep:
+                print("  警告：自訂 header 有一段缺少冒號，已忽略該段（值含 ; 時請改用 JSON 寫法）")
+                continue
+            raw_pairs.append((name.strip(), value.strip()))
+
+    headers: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    for raw_name, raw_value in raw_pairs:
+        name = str(raw_name).strip()
+        if not name:
+            print("  警告：自訂 header 名稱是空的，已忽略")
+            continue
+        if not _HEADER_NAME_RE.match(name):
+            print(f"  警告：自訂 header 名稱 {name!r} 不合法，已忽略")
+            continue
+        lowered = name.lower()
+        if lowered in _BLOCKED_HEADERS:
+            print(f"  警告：自訂 header {name} 會覆寫必要欄位，已忽略")
+            continue
+        if lowered.startswith(_BLOCKED_HEADER_PREFIXES):
+            print(f"  警告：自訂 header {name} 屬於 SDK 內部欄位，已忽略")
+            continue
+        if not isinstance(raw_value, str):
+            print(f"  警告：自訂 header {name} 的值不是字串，已忽略")
+            continue
+        # 換成 SDK 用的寫法，避免同名不同大小寫在線路上變成兩條
+        name = _CANONICAL_HEADER_NAMES.get(lowered, name)
+        lowered = name.lower()
+        value = raw_value.replace(_RUN_ID_TOKEN, _RUN_ID).strip()
+        if not value:
+            print(f"  警告：自訂 header {name} 的值是空的，已忽略")
+            continue
+        if not value.isascii():
+            # httpx 用 ASCII 編碼 header 值（連 latin-1 可編碼的 café 都會炸），
+            # 而且那是裸 UnicodeEncodeError，不會被 except openai.* 接到。
+            print(f"  警告：自訂 header {name} 的值含非 ASCII 字元（HTTP header 只能是 ASCII），已忽略")
+            continue
+        if _HEADER_VALUE_BAD_RE.search(value):
+            print(f"  警告：自訂 header {name} 的值含控制字元或換行，已忽略")
+            continue
+        if lowered in seen:
+            print(f"  警告：自訂 header {seen[lowered]} 重複設定（不分大小寫），以最後一筆為準")
+            headers.pop(seen.pop(lowered), None)
+        if lowered in _NOTED_HEADERS:
+            print(f"  提示：已使用自訂 {name}，SDK 預設值會被覆寫")
+        headers[name] = value
+        seen[lowered] = name
+    return headers
+
+
+def _safe_extra_headers(env_key: str) -> dict[str, str]:
+    """從 os.environ 讀取並解析 header 設定；未設定時回傳空 dict。"""
+    return parse_extra_headers(os.getenv(env_key, ""))
+
+
 # .env 中 API 設定的編號前綴樣式（API1_, API12_ ...）
 _API_ENV_PREFIX_RE = re.compile(r"^API(\d+)_")
+
+
+def _resolve_parallel_limit(limit_str: str, api_type: str, label: str) -> int:
+    """解析並發上限：有獨立值就用，否則用類別預設；無效值印警告後退回預設。
+
+    多 API 格式（APIx_PARALLEL_LIMIT）與舊版單一 API 格式（PARALLEL_LIMIT）共用，
+    避免兩邊的驗證規則（≥ 1、非數字）分岔。
+    """
+    default = MAIN_DEFAULT_LIMIT if api_type == "main" else FALLBACK_DEFAULT_LIMIT
+    limit_str = (limit_str or "").strip()
+    if not limit_str:
+        return default
+    try:
+        value = int(limit_str)
+    except ValueError:
+        print(f"  警告：{label} 的 PARALLEL_LIMIT '{limit_str}' 無效，使用類別預設")
+        return default
+    if value < 1:
+        print(f"  警告：{label} 的 PARALLEL_LIMIT={limit_str} 必須 ≥ 1，使用類別預設")
+        return default
+    return value
 
 
 def _discover_api_indices() -> list[int]:
@@ -301,7 +464,8 @@ def load_api_configs() -> list[ApiConfig]:
 
     掃描環境中所有 API<數字>_ 前綴（編號可跳號），逐一解析。
     每個 API 必填：_TYPE, _MODEL_PROVIDER, _MODEL, _API_KEY, _BASE_URL
-    可選：_PARALLEL_LIMIT（覆蓋類別預設）
+    可選：_PARALLEL_LIMIT（覆蓋類別預設）、_EXTRA_HEADERS（自訂 HTTP header，
+    格式見 parse_extra_headers；舊版單一 API 格式用 EXTRA_HEADERS）
     """
     configs: list[ApiConfig] = []
 
@@ -334,18 +498,8 @@ def load_api_configs() -> list[ApiConfig]:
         model_provider = os.getenv(f"{prefix}MODEL_PROVIDER", "").strip()
 
         # 解析並發上限：獨立值 > 類別預設
-        limit_str = os.getenv(f"{prefix}PARALLEL_LIMIT", "").strip()
-        if limit_str:
-            try:
-                parallel_limit = int(limit_str)
-                if parallel_limit < 1:
-                    print(f"  警告：API{idx} 的 PARALLEL_LIMIT={limit_str} 必須 ≥ 1，使用類別預設")
-                    parallel_limit = MAIN_DEFAULT_LIMIT if api_type == "main" else FALLBACK_DEFAULT_LIMIT
-            except ValueError:
-                print(f"  警告：API{idx} 的 PARALLEL_LIMIT '{limit_str}' 無效，使用類別預設")
-                parallel_limit = MAIN_DEFAULT_LIMIT if api_type == "main" else FALLBACK_DEFAULT_LIMIT
-        else:
-            parallel_limit = MAIN_DEFAULT_LIMIT if api_type == "main" else FALLBACK_DEFAULT_LIMIT
+        parallel_limit = _resolve_parallel_limit(
+            os.getenv(f"{prefix}PARALLEL_LIMIT", ""), api_type, f"API{idx}")
 
         configs.append(ApiConfig(
             api_id=f"API{idx}",
@@ -355,6 +509,7 @@ def load_api_configs() -> list[ApiConfig]:
             base_url=base_url,
             api_type=api_type,
             parallel_limit=parallel_limit,
+            extra_headers=_safe_extra_headers(f"{prefix}EXTRA_HEADERS"),
         ))
 
     if not configs:
@@ -369,7 +524,9 @@ def load_api_configs() -> list[ApiConfig]:
                 model=os.getenv("MODEL", "").strip(),
                 base_url=os.getenv("BASE_URL", "").strip(),
                 api_type="main",
-                parallel_limit=MAIN_DEFAULT_LIMIT,
+                parallel_limit=_resolve_parallel_limit(
+                    os.getenv("PARALLEL_LIMIT", ""), "main", "舊版單一 API"),
+                extra_headers=_safe_extra_headers("EXTRA_HEADERS"),
             ))
 
     return configs

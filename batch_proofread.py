@@ -9,7 +9,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from glossary import load_glossary, auto_extract_glossary, MISSING_SENTINELS
-from llm_translator import delete_checkpoint_files, get_debug_message_dir
+from llm_translator import cleanup_checkpoint, get_debug_message_dir
 from proofreader import (run_proofread, run_quick_proofread,
                          _load_session, _load_quick_session,
                          _proofread_checkpoint_dir, _quick_checkpoint_dir)
@@ -20,6 +20,23 @@ def _get_workplace():
     wp = Path(__file__).parent / "workplace"
     wp.mkdir(parents=True, exist_ok=True)
     return wp
+
+def _clear_proofread_checkpoints(workplace, reason):
+    """清掉校對自己的 checkpoint，共享的 `_checkpoint` 交給 cleanup_checkpoint。
+
+    `_proofread_checkpoint`／`_quick_checkpoint` 只有校對自己會寫，可以無條件刪；
+    但 `_checkpoint` 是主翻譯的，主翻譯中斷時 `session.json` 還躺在裡面，
+    這裡若跟著 rmtree，主翻譯的續傳進度就全毀了（R2 風險 2-5）。
+    cleanup_checkpoint 看到 session.json 會自己保留並回 False。
+    """
+    import shutil
+    for cd in (_proofread_checkpoint_dir(str(workplace)), _quick_checkpoint_dir(str(workplace))):
+        if cd.exists():
+            shutil.rmtree(cd)
+    if cleanup_checkpoint(str(workplace), reason=reason):
+        print("  已清除校對舊進度（共享 _checkpoint 無進行中的主翻譯）。")
+    else:
+        print("  已清除校對舊進度（偵測到主翻譯進度，共享 _checkpoint 已保留）。")
 
 def timestamp(msg):
     # 內層字串用單引號：同一種引號嵌套的 f-string 是 Python 3.12（PEP 701）才合法，
@@ -251,11 +268,29 @@ def find_existing_progress():
         return quick_session
     return None
 
+def _session_excel_path(session):
+    """取出校對 session 的來源路徑；缺失或型別不對回 None（進度檔損壞）。"""
+    ep = session.get("excel_path") if isinstance(session, dict) else None
+    return ep if isinstance(ep, str) and ep else None
+
+
+def _print_broken_session_message():
+    print("\n  ⚠️ 進度檔缺少來源路徑，可能已損壞。")
+    print("     請備份 _proofread_checkpoint/session.json（或 _quick_checkpoint/session.json）")
+    print("     後刪除它，再重新執行。")
+
+
 def prompt_resume(session):
+    ep = _session_excel_path(session)
+    if not ep:
+        # session.json 可能損壞或是不完整：直接索引 session['excel_path']
+        # 會讓使用者只看到 KeyError＋traceback（覆檢 §2.2）。
+        _print_broken_session_message()
+        return False
     print(f"\n{SEP}")
     print("  發現上次校對進度")
     print(SEP)
-    print(f"  目標: {Path(session['excel_path']).name}")
+    print(f"  目標: {Path(ep).name}")
     mode_label = "快速校對" if session.get("mode") == "quick_proofread" else "完整校對"
     print(f"  模式: {mode_label}")
     cs = session.get("completed_sheets", [])
@@ -264,6 +299,7 @@ def prompt_resume(session):
     print(f"  待處理工作表: {len(ps)}")
     print(f"\n  繼續校對？(y/n): ", end='')
     return input().strip().lower() == "y"
+
 
 def main():
     print(SEP)
@@ -309,6 +345,12 @@ def main():
         print(f"  已清除 debug 訊息\n")
 
     exist_session = find_existing_progress()
+    exist_excel = _session_excel_path(exist_session) if exist_session else None
+    if exist_session and not exist_excel:
+        # 進度檔缺少來源路徑（人手改壞／寫到一半）：這裡直接結束，不提供任何
+        # 清除選項——先讓使用者備份後自行處理，避免把手上的進度莫名其妙清掉。
+        _print_broken_session_message()
+        return
     if exist_session and exist_session.get("mode") != mode:
         old_label = "完整校對" if exist_session.get("mode") == "proofread" else "快速校對"
         new_label = "快速校對" if mode == "quick_proofread" else "完整校對"
@@ -317,25 +359,15 @@ def main():
             print("  已取消。")
             input("\n按 Enter 鍵...")
             return
-        old_cp = (_quick_checkpoint_dir if exist_session.get("mode") == "quick_proofread" else _proofread_checkpoint_dir)(str(_get_workplace()))
-        if old_cp.exists():
-            import shutil
-            shutil.rmtree(old_cp)
-        delete_checkpoint_files(str(_get_workplace()))
-        print("  已清除舊進度（含共享 _checkpoint）。")
+        # 舊模式與新模式的校對 checkpoint 一起清；共享的 _checkpoint 走
+        # cleanup_checkpoint，主翻譯中斷時（session.json 還在）會自動保留。
+        _clear_proofread_checkpoints(_get_workplace(), reason="proofread_abort")
         exist_session = None
     if exist_session:
         if not prompt_resume(exist_session):
-            if exist_session.get("mode") == "quick_proofread":
-                cp = _quick_checkpoint_dir(str(_get_workplace()))
-            else:
-                cp = _proofread_checkpoint_dir(str(_get_workplace()))
-            if cp.exists():
-                import shutil; shutil.rmtree(cp)
-            delete_checkpoint_files(str(_get_workplace()))
-            print("\n  已清除舊進度（含共享 _checkpoint）。")
+            _clear_proofread_checkpoints(_get_workplace(), reason="proofread_abort")
         else:
-            excel_path = Path(exist_session["excel_path"])
+            excel_path = Path(exist_excel)
             glossary_path_str = exist_session.get("glossary_path")
             glossary_path = Path(glossary_path_str) if glossary_path_str else None
             glossary_sheets = exist_session.get("glossary_sheets")
@@ -395,6 +427,12 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        # Ctrl+C：asyncio.run 會先取消主 task 再拋 KeyboardInterrupt。
+        # 不接住會看到兩段 traceback 與 Windows 的 0xC000013A 退出碼；
+        # 實際上 P3／P4a 的 part 與 session 都已落地，重新執行可續傳。
+        print("\n\n  ⏹️ 已中斷：已完成批次的校對進度已保存，重新執行即可續傳。")
+        sys.exit(130)
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
             print("\n  ⚠️ 所有 API 已永久停用（累計 429 限流達門檻；只有一個可用 API 時門檻會放寬），無法繼續。")

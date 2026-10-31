@@ -11,14 +11,12 @@
 An AI-powered automated pipeline designed for large-scale game text translation. Scripts can be placed anywhere — no specific project structure required.
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update v0.4.6 (20/10/2026), see [Changelog](Changelog.md) for details
-- **Much faster term scanning**: new TL4 candidate index (inverted index for plain terms, 3-gram index for terms with punctuation or digits); `narrow_relevant_glossary` cold start drops from 14-16s to 0.42-0.48s and `scan_issues` takes 0.21s for 3,000 rows; main translation, retranslation, P2 evaluation and P3 polish share one index instead of rebuilding it per batch
-- **Leaner prompts**: main translation sends only `index` and `english`, dropping `notes`, `wiki_url` and the "return an empty string for unchanged translations" instruction; batch payload shrinks from 16,564 to 7,253 characters (-56%)
-- **Resume and I/O**: `progress.json` is maintained incrementally (one checkpoint-directory scan per sheet) and translation/P3 persist after every batch; a fresh translation run reads the Excel file only once; `iterrows` hot spots vectorised; the review report is coloured while writing
-- **Timeouts and 429**: the LLM client now uses per-phase timeouts (connect 60 / read 1,800 / write 300 / pool 300 seconds) with SDK retries disabled, and the per-request `timeout=` overrides at four call sites are removed; duplicate 429s received while cooling down no longer add extra strikes
-- **Main API default concurrency is now 100**: `MAIN_DEFAULT_LIMIT` changed from 10 to 100; main APIs without `APIx_PARALLEL_LIMIT` in `.env` now default to 100 (lower the concurrency if you hit 429s)
-- **Misc**: removed unused `API_TIMEOUT` imports from `enforcer.py` / `llm_translator.py` / `proofreader.py`
-- **Simplified** the content of README.md and README_en.md
+## Latest Update v0.4.7 (1/11/2026), see [Changelog](Changelog.md) for details
+- **Translation correctness**: retranslation / polish writes now pass a regression gate, so a model echoing the English source can no longer overwrite valid Chinese; glossary entries whose translation equals the source (player names, etc.) are no longer treated as untranslated; rows with a missing source are no longer sent back for retranslation
+- **Safe resume**: proofreading uses its own `_proofread_checkpoint`, so an interrupted main translation no longer loses its progress; resume now compares a source fingerprint and asks "discard and retranslate / cancel" if the workbook changed
+- **Custom HTTP headers**: new optional `APIx_EXTRA_HEADERS` (JSON or `Name: Value; ...` shorthand) for providers such as **OpenCode Go** that require `x-opencode-session` and a custom User-Agent; when unset, requests are identical to the previous release
+- **Misc**: Ctrl+C now prints one line and exits with code 130; the legacy single API format supports `PARALLEL_LIMIT`
+- Highlights from v0.4.6 (much faster term scanning, main API default concurrency 100, per-phase timeouts, ...) still apply; see the Changelog
 
 ### Features
 
@@ -71,20 +69,26 @@ pip install openpyxl pandas openai python-dotenv json-repair
 - This tool supports any **OpenAI-compatible API**; the recommended option is the `deepseek-flash` model from [DeepSeek Official](https://platform.deepseek.com/)
 - Copy `.env.example` to `.env` and fill in your settings. Two formats are supported; examples below:
 
+### Optional: custom HTTP headers (required by some providers)
+- A few providers require specific headers on every request. **OpenCode Go** for example requires `x-opencode-session` (a fixed session id) and recommends a custom User-Agent. Add `APIx_EXTRA_HEADERS` to the matching API:
+- Both `osrs-translator` values are yours to fill in, but they must be ASCII and must not contain `;` (use the JSON form if they do)
+- The legacy single API format uses `EXTRA_HEADERS=...`; when unset, requests are identical to the previous release
+
 ### Multi-API Format (Optional)
 
 ```env
 # Main API (default concurrency=100)
 API1_TYPE=main
-# API1_PARALLEL_LIMIT=100   <- optional: uncomment to set a custom concurrency
+# API1_PARALLEL_LIMIT=100  # optional: uncomment to set a custom concurrency
 API1_MODEL_PROVIDER=Deepseek
 API1_MODEL=deepseek-flash
 API1_API_KEY=sk-your_api_key_here
 API1_BASE_URL=https://api.deepseek.com/
+# API1_EXTRA_HEADERS=x-opencode-session: osrs-translator; User-Agent: osrs-translator  # optional: uncomment to enable
 
 # Fallback API (default concurrency=1, recommended for free APIs)
 API2_TYPE=fallback
-# API2_PARALLEL_LIMIT=1    <- optional: uncomment to set a custom concurrency
+# API2_PARALLEL_LIMIT=1  # optional: uncomment to set a custom concurrency
 API2_MODEL_PROVIDER=nvidia
 API2_MODEL=deepseek-ai/deepseek-v4-flash
 API2_API_KEY=nvapi-your_free_key_here
@@ -96,6 +100,7 @@ API2_BASE_URL=https://integrate.api.nvidia.com/v1
 API_KEY=sk-your_api_key_here
 MODEL_PROVIDER=Deepseek
 MODEL=deepseek-flash
+# PARALLEL_LIMIT=100  # optional: uncomment to set a custom concurrency
 BASE_URL=https://api.deepseek.com/
 ```
 ---

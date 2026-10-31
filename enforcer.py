@@ -7,12 +7,14 @@ from datetime import datetime
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from glossary import (ADD_LIST, find_term_spans, build_relevance_context,
+from glossary import (find_term_spans, build_relevance_context,
                       filter_relevant_terms, MISSING_SENTINELS, TermLookup,
-                      drop_placeholder_spans, placeholder_spans)
+                      drop_placeholder_spans, placeholder_spans,
+                      keep_english_terms)
 from llm_translator import (
-    BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary,
+    BATCH_SIZE_LIMIT, CHECKPOINT_SUBDIR, atomic_write_text, get_relevant_glossary,
     is_missing_translation, _english_hint, _english_hint_at,
+    _is_na, english_fingerprint_df, _checkpoint_dir,
 )
 from api_config import (
     OVER_RETURN_TOLERANCE,
@@ -135,7 +137,15 @@ def check_untranslated(english_text: str, translated_text, keep_original_terms: 
     這些條目譯文與原文相同是「正確行為」，不視為未翻譯。
     集合內一律存小寫（見 scan_issues 的建構式），比對時也把小寫化，
     否則工作表原文的大小寫與 ADD_LIST 的 key 不同時仍會被判為未翻譯。
+
+    原文缺值（空白列）直接回傳 []：沒有原文就沒有「翻譯得對不對」可言。
+    舊寫法會把 english=NaN 的列判成「translation 欄位為空」，於是空白列被
+    當成問題列送進重譯（提示詞出現 "english": "nan"），永遠修不好；
+    scan_issues 另有一層跳過，這裡的早退是給直接呼叫本函式的端點用的。
     """
+    # 原文是空值或純空白 → 不判未翻譯（_is_na 與 is_missing_translation 同口徑）
+    if _is_na(english_text) or not str(english_text).strip():
+        return []
     issues = []
     keep_original_terms = keep_original_terms or set()
     eng_str = str(english_text).strip()
@@ -163,6 +173,53 @@ def check_untranslated(english_text: str, translated_text, keep_original_terms: 
             if stripped and re.search(r"[a-zA-Z]", stripped):
                 issues.append("譯文與原文相同，未實際翻譯")
     return issues
+
+
+def _fatal(eng_raw, candidate, keep: frozenset[str]) -> set[str]:
+    """回傳這一筆候選譯文的「致命問題」集合（{'untranslated', 'placeholder'} 的子集）。
+
+    只跑 check_untranslated + check_placeholder 兩個便宜檢查，刻意不含 glossary：
+    術語檢查要對整份詞庫逐條比對，實測全詞庫 146 ms/列，套在「每次寫入前」
+    會讓重譯慢上數千倍（R1 1-A9）。術語錯由重譯提示詞與下一輪掃描處理，
+    不需要、也不可以在這裡當成寫入守門。
+
+    keep 是 keep_english_terms() 的結果，由呼叫端算好傳入；本函式不重算。
+    """
+    out: set[str] = set()
+    if check_untranslated(eng_raw, candidate, keep_original_terms=keep):
+        out.add("untranslated")
+    # candidate 本身缺值時不能拿 str(candidate) 去比對佔位符：
+    # 那會把 "nan" 當成一般文字，與「譯文空白」的語意混淆
+    if not is_missing_translation(candidate) and check_placeholder(str(eng_raw), str(candidate)):
+        out.add("placeholder")
+    return out
+
+
+def regressed(eng_raw, previous, candidate, keep: frozenset[str] = frozenset()) -> str | None:
+    """回傳拒絕理由字串；None = 放行。規則是「不得比原本更差」。
+
+    為什麼不是「必須通過所有檢查」：既有成品本來就有大量帶舊問題的譯文
+    （R1 實測 329 列會被全通過式守門擋下），把「沒變好」當成「變差」會讓
+    覆寫路徑把可用的譯文擋在門外，列永遠停在壞值、還會多燒一輪。
+    這裡只追究「候選新增了原本沒有的致命問題」。
+
+    原文缺值（空白列）一律放行：沒有原文可翻，就沒有未翻譯／佔位符可壞。
+    previous 是「本次寫入前 df 中的值」，可能是 NaN／None／pd.NA。
+    """
+    if _is_na(eng_raw):
+        return None
+    before = _fatal(eng_raw, previous, keep)
+    after = _fatal(eng_raw, candidate, keep)
+    new = after - before
+    # 「把未翻譯修好」優先於「佔位符缺失」：前值還沒有譯文（或只是回吐原文）時，
+    # 候選只要真的產生中文就已是一大進步；此時掉佔位符是可以在下一輪由
+    # preprocess_issues 修、也會進審查報告的次要問題，不該把有進展的候選擋掉
+    # （擋掉等於讓該列永遠停在英文／空白，比「有譯文但少了 [x]」更糟）。
+    if "untranslated" in before and "untranslated" not in after:
+        new.discard("placeholder")
+    if new:
+        return f"新增致命問題 {'、'.join(sorted(new))}"
+    return None
 
 
 def check_space_issues(translated_text: str) -> list:
@@ -279,26 +336,36 @@ def narrow_relevant_glossary(df, glossary) -> dict:
     # 保留 glossary 的原始順序（下游 get_relevant_glossary 依賴相對順序穩定）
     return {e: c for e, c in glossary.items() if e in matched}
 
-def scan_issues(df, relevant_glossary, lookup=None) -> list[tuple]:
+def scan_issues(df, relevant_glossary, lookup=None, keep=None) -> list[tuple]:
     """走訪所有行，彙整三種檢查的結果，回傳問題 pool。
 
     lookup：可選的 TermLookup；由呼叫端建立一次共用（一次 enforce 最多會呼叫
     這個函式 10 次，全詞庫重建索引要 0.125 秒，絕不可每輪重建）。
 
+    keep：可選的「譯文＝原文才正確」術語集合（keep_english_terms 的結果）。
+    不傳時由 relevant_glossary 現算一次；_enforce_async 會自己算好、三輪共用，
+    因為本函式每輪至少被呼叫一次，重算等於白白多掃一次詞庫。
+
     這裡刻意保留 df.iterrows()：改動後的成本由「術語比對」變成「逐列迭代」，
     而 iterrows 在 10 萬列上約 1.9 秒、相對於省下的數分鐘可以接受；
     保留 (idx, row, issues) 的 tuple 契約可以讓下游三個消費者不必改動。
     """
-    keep_original_terms = {k.strip().lower() for k, v in ADD_LIST.items() if v.strip().lower() == str(k).strip().lower()}
+    if keep is None:
+        keep = keep_english_terms(relevant_glossary)
     if lookup is None:
         lookup = TermLookup(relevant_glossary)
     pool = []
     for idx, row in df.iterrows():
         eng = row.get("english")
         trans = row.get("translation")
+        # 原文缺值（空白列）不檢查、也不進問題池：沒有原文就沒有可翻譯的內容，
+        # 舊寫法會把它判成「translation 欄位為空」而送進重譯（提示詞出現
+        # "english": "nan"），永遠修不好，還可能把真問題擠出「<3 條跳過重譯」門檻。
+        if _is_na(eng):
+            continue
         all_issues = []
 
-        untrans_issues = check_untranslated(eng, trans, keep_original_terms=keep_original_terms)
+        untrans_issues = check_untranslated(eng, trans, keep_original_terms=keep)
         if untrans_issues:
             for ui in untrans_issues:
                 all_issues.append(("untranslated", "", ui))
@@ -452,9 +519,15 @@ async def _retry_round(client, model_name, pool, glossary, rnd, lookup=None):
             mapped[r["index"]] = r
     return list(mapped.values())
 
-async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None, shared_pool=None):
-    """非同步執行重譯循環，使用多 API 共享隊列模式（支援續傳）"""
-    from llm_translator import save_backup_part, _sanitize_sheet_name
+async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None, shared_pool=None,
+                         checkpoint_root: str = CHECKPOINT_SUBDIR):
+    """非同步執行重譯循環，使用多 API 共享隊列模式（支援續傳）
+
+    checkpoint_root：checkpoint 子目錄名（`_checkpoint` 或 `_proofread_checkpoint`）。
+    校對管線（P4a）與主翻譯共用同一張工作表時，兩者的 part／progress／
+    enforce_checkpoint 必須各自獨立，否則互相覆蓋、續傳會還原到另一邊的資料。
+    """
+    from llm_translator import save_backup_part
     import uuid
     if shared_pool is None:
         print("  無可用 API，跳過重譯")
@@ -467,20 +540,42 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
     start_round = 0
     enforce_tag = uuid.uuid4().hex[:8]
     cp_file = None
+    # 原文指紋：checkpoint 只記輪次時，別的工作表（甚至別的 Excel 檔）留下的
+    # enforce_checkpoint.json 會被當成本次的進度，續傳直接跳過該重譯的輪次
+    # （R1 懷疑點 6 實測：全新資料 5 列應重譯，只跑了第 3 輪）。
+    # 因此讀檔要驗「工作表名 + 原文指紋」，任一不符就從第 1 輪重跑。
+    english_sha1 = english_fingerprint_df(df)
     if output_dir and sheet_name:
-        cp_file = Path(output_dir) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
+        # 走 _checkpoint_dir：root 的合法值檢查（assert）只保留在那一處，
+        # 不在這裡再拼一次路徑（拼錯時 save_backup_part 才炸，ecp 已經先寫錯目錄）
+        cp_file = _checkpoint_dir(output_dir, sheet_name, checkpoint_root) / "enforce_checkpoint.json"
         if cp_file.exists():
             try:
                 cp_data = json.loads(cp_file.read_text(encoding="utf-8"))
-                start_round = cp_data.get("completed_rounds", 0)
-                # 從 checkpoint 載入之前生成的 enforce_tag，若無則用新的
-                enforce_tag = cp_data.get("enforce_tag", enforce_tag)
-                print(f"  偵測到重譯進度，從第 {start_round + 1} 輪開始")
+                if cp_data.get("sheet") != sheet_name or cp_data.get("english_sha1") != english_sha1:
+                    print("  ⚠️ 重譯進度記錄的工作表或原文指紋不符，忽略記錄並從第 1 輪重新開始")
+                else:
+                    start_round = cp_data.get("completed_rounds", 0)
+                    # 從 checkpoint 載入之前生成的 enforce_tag，若無則用新的
+                    enforce_tag = cp_data.get("enforce_tag", enforce_tag)
+                    print(f"  偵測到重譯進度，從第 {start_round + 1} 輪開始")
             except Exception:
                 pass
 
+    # 「譯文＝原文才正確」的術語集合：三輪共用同一份，放在迴圈外只算一次
+    keep = keep_english_terms(relevant_glossary)
+
+    # 原文缺值列：scan_issues 直接跳過（沒有原文就沒有「譯得對不對」可言），
+    # 但跳過是靜默的，使用者會看到「問題池比往年少」卻不知道原因，連帶影響
+    # 「少於 3 條就跳過重譯」的門檻（G2）。只印一次，不放在 scan_issues 裡——
+    # 那個函式每輪（含預處理後）被呼叫多次，會洗版。
+    if "english" in df.columns:
+        skipped_na = int(sum(1 for v in df["english"].tolist() if _is_na(v)))
+        if skipped_na:
+            print(f"  跳過 {skipped_na} 列原文缺值（不列入問題池）")
+
     for rnd in range(start_round, 3):
-        pool = scan_issues(df, relevant_glossary, lookup)
+        pool = scan_issues(df, relevant_glossary, lookup, keep=keep)
 
 
         # ★ 腳本預處理（每輪重譯前都執行）
@@ -503,7 +598,7 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
                 print(f"  ⚡ 腳本預處理前問題：{'、'.join(before_parts)}")
 
             preprocess_issues(df, pool)
-            pool = scan_issues(df, relevant_glossary, lookup)
+            pool = scan_issues(df, relevant_glossary, lookup, keep=keep)
 
             # 統計修正了哪些類型
             space_after = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "space")
@@ -550,7 +645,14 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
         batches = [pool[bs:bs + BATCH_SIZE_LIMIT] for bs in range(0, len(pool), BATCH_SIZE_LIMIT)]
         total_batches = len(batches)
 
+        # 守門拒絕數：獨立於 skipped（R1 1-A10：計入 skipped 會印成「回傳無效
+        # （非物件、index 不在工作表中，或譯文非字串）」，把「內容不合格」
+        # 說成「回傳格式錯誤」，完全誤導排查）。逐分類累計是為了輪末那行統計。
+        guard_rejected = 0
+        guard_labels = {"untranslated": 0, "placeholder": 0}
+
         async def _retry_process(ws, job):
+            nonlocal guard_rejected
             cfg = ws["cfg"]
             batch_slice = job.batch
             try:
@@ -576,8 +678,27 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
                         continue
                     try:
                         if idx in batch_indices:
+                            previous = df.at[idx, "translation"]
+                            # df 可能是子集：沒有 english 欄時給 None，_is_na(None)
+                            # 會讓 regressed 直接放行（沒有原文可比，就不該擋）
+                            eng_raw = df.at[idx, "english"] if "english" in df.columns else None
+                            reason = regressed(eng_raw, previous, trans, keep)
+                            if reason:
+                                # 候選比原本更差（新增未翻譯／佔位符遺失）→ 不覆寫，
+                                # 保留原值。既不計 skipped（不是格式錯），也不計 fixed
+                                guard_rejected += 1
+                                for _label in ("untranslated", "placeholder"):
+                                    if _label in reason:
+                                        guard_labels[_label] += 1
+                                continue
                             df.at[idx, "translation"] = trans
-                            fixed += 1
+                            # 只有真的改變才計入「已修正」：模型原樣回傳舊值
+                            # （常見的 no-op 候選）會寫入同一個字串，卻被印成
+                            # 「N 条已修正」，讓修正率看起來比實際好（G3）。
+                            # previous 可能是 pd.NA/NaN，不能寫 trans != previous
+                            # （boolean value of NA is ambiguous），先判型別。
+                            if not (isinstance(previous, str) and previous == trans):
+                                fixed += 1
                         else:
                             skipped += 1
                     except (TypeError, ValueError, KeyError, IndexError):
@@ -600,8 +721,13 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
         if batches:
             await asyncio.gather(*[shared_pool.submit(bn, b, _retry_process) for bn, b in enumerate(batches, 1)])
 
+        # 每輪一行守門統計：被擋下的候選（保留舊值）必須看得到，
+        # 否則使用者只會看到「修正率很低」而不知道是守門在擋
+        print(f"  本輪守門拒絕 {guard_rejected} 條（未翻譯 {guard_labels['untranslated']}、"
+              f"佔位符 {guard_labels['placeholder']}）")
+
         # 計算修正率，決定是否繼續
-        post_pool = scan_issues(df, relevant_glossary, lookup)
+        post_pool = scan_issues(df, relevant_glossary, lookup, keep=keep)
 
         # ★ 儲存本輪修正到 part 檔案（原子寫入） ★
         if output_dir:
@@ -615,7 +741,10 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
                 if not is_missing_translation(trans, english=_english_hint(row.get("english"))):
                     backup_data[str(idx)] = str(trans)
             if backup_data:
-                save_backup_part(output_dir, enforce_tag, rnd + 1, backup_data, sheet_name)
+                # root=checkpoint_root：校對管線的 part 檔必須寫在 _proofread_checkpoint，
+                # 不可與主翻譯的 _checkpoint 共用（R2 風險 2-1）
+                save_backup_part(output_dir, enforce_tag, rnd + 1, backup_data, sheet_name,
+                                 root=checkpoint_root)
 
         # ★ 儲存 enforce checkpoint ★
         if cp_file:
@@ -623,6 +752,10 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
             atomic_write_text(cp_file, json.dumps({
                 "completed_rounds": rnd + 1,
                 "enforce_tag": enforce_tag,
+                # 來源識別：跨工作表／跨 Excel 檔殘留的 checkpoint 不可被沿用
+                # （讀取端靠這兩個欄位驗證，見上方「檢查 enforce checkpoint」）
+                "sheet": sheet_name,
+                "english_sha1": english_sha1,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }, ensure_ascii=False, indent=2))
 
@@ -652,7 +785,8 @@ async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None
 
 async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None,
                         report_name: str = "review_report.xlsx", write_report: bool = True,
-                        sheet_name: str | None = None, shared_pool=None) -> tuple:
+                        sheet_name: str | None = None, shared_pool=None,
+                        checkpoint_root: str = CHECKPOINT_SUBDIR) -> tuple:
     df = df.copy()
     review_rows = []
 
@@ -669,7 +803,8 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
 
     # 非同步重譯（使用共享池；未提供時建立臨時池）
     if shared_pool is not None:
-        df = await _enforce_async(df, relevant_glossary, output_dir, sheet_name, shared_pool)
+        df = await _enforce_async(df, relevant_glossary, output_dir, sheet_name, shared_pool,
+                                  checkpoint_root=checkpoint_root)
     else:
         tmp_pool = SharedBatchPool()
         try:
@@ -678,13 +813,15 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
             tmp_pool = None
         if tmp_pool is not None:
             try:
-                df = await _enforce_async(df, relevant_glossary, output_dir, sheet_name, tmp_pool)
+                df = await _enforce_async(df, relevant_glossary, output_dir, sheet_name, tmp_pool,
+                                          checkpoint_root=checkpoint_root)
             finally:
                 await tmp_pool.close()
 
-    # 最終審查掃描
+    # 最終審查掃描（與重譯輪同一套 keep：譯文＝原文才正確的術語不判未翻譯）
+    keep = keep_english_terms(relevant_glossary)
     lookup = TermLookup(relevant_glossary)
-    final_pool = scan_issues(df, relevant_glossary, lookup)
+    final_pool = scan_issues(df, relevant_glossary, lookup, keep=keep)
     for idx, row, issues in final_pool:
         trans = row.get("translation")
         # 審查報告的「目前譯文」不可出現 "<NA>"／"nan" 這類缺值字面值

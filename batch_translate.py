@@ -612,7 +612,7 @@ async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_pa
 
 async def main():
     print(SEP)
-    print("      混合翻譯管線 v1.5")
+    print("      混合翻譯管線")
     print(f"      工作目錄: {_get_workplace()}")
     print(SEP)
 
@@ -810,8 +810,8 @@ async def main():
     cleanup_checkpoint(workplace, reason="fresh_run", force=True)
 
     # 記下來源指紋：之後的續傳靠它判斷「來源 Excel 還是不是同一份」。
-    # 這裡直接吃上面已載入的 cached_dfs，不再重讀工作簿（R2 實測每張表重讀 +5 秒）；
-    # 兩條讀法算出的 sha1 等價，由 tests/test_fingerprint.py 的 A12 釘住。
+    # 這裡直接吃上面已載入的 cached_dfs，不再重讀工作簿（實測每張表重讀 +5 秒）；
+    # 兩條讀法算出的 sha1 等價，可直接沿用快取。
     save_source_fingerprint(workplace, excel_path,
                             {sn: english_fingerprint_df(cached_dfs[sn]) for sn in sheet_names})
 

@@ -37,6 +37,15 @@ PROGRESS_FILE = "progress.json"
 SESSION_FILE = "session.json"
 QUICK_CHECKPOINT_SUBDIR = "_quick_checkpoint"
 
+# P2 雙輪評估的取樣溫度：兩輪刻意不對稱（R1 穩定、R2 探索），
+# 降低兩輪結果的同質性；同溫同提示詞的兩輪結果會高度重疊。
+# 注意：兩輪仍是同模型、同提示詞、同批次，只是相關性較低，並非統計獨立的樣本。
+P2_TEMPERATURE_R1 = 0.1
+P2_TEMPERATURE_R2 = 0.3
+
+# P3 潤色取樣溫度：潤色需要表達彈性才能擺脫翻譯腔。
+P3_TEMPERATURE = 0.3
+
 def _timestamp(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"  [{now}] {msg}")
@@ -109,7 +118,7 @@ def template_correction(df, glossary, output_dir, sheet_name=None):
 
 # Phase 2 prompt: LLM Dual-round Fluency Evaluation
 SYSTEM_PROMPT_EVAL = (
-    "你是一个中文翻译品质评估专家。\n"
+    "你是一个简体中文翻译品质评估专家。\n"
     "请遵守以下规则：\n"
     "请评估以下译文的流畅度和翻译腔程度，分为四级：\n\n"
     "- 没问题：流畅自然，没有翻译腔\n"
@@ -118,7 +127,7 @@ SYSTEM_PROMPT_EVAL = (
     "- 严重：完全不符合中文表达习惯\n\n"
     "输出格式为原始 JSON 阵列（不要使用 ```json 代码块包裹），每条物件包含 \"index\"、\"level\" 和 \"reason\" 三个栏位。\n"
     "例如：[{\"index\": 0, \"level\": \"没问题\", \"reason\": \"流畅自然\"}]\n"
-    "## 强制术语表（禁止使用官方和社区通常的翻譯，遇到以下英文词必须使用指定的中文翻译）\n"
+    "## 强制术语表（禁止使用官方和社区通常的翻译，遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译）\n"
     "{RELEVANT_GLOSSARY}"
 )
 
@@ -165,7 +174,8 @@ def _pad_eval_results(results, batch):
     return padded
 
 
-async def _evaluate_batch(client, model, batch, glossary, api_id, lookup=None):
+async def _evaluate_batch(client, model, batch, glossary, api_id, lookup=None,
+                          temperature: float = P2_TEMPERATURE_R1):
     relevant = get_relevant_glossary(batch, glossary, lookup)
     glossary_str = "\n".join([f"  {e} → {c}" for e, c in relevant]) if relevant else "  无"
     system_prompt = SYSTEM_PROMPT_EVAL.replace("{RELEVANT_GLOSSARY}", glossary_str)
@@ -184,7 +194,7 @@ async def _evaluate_batch(client, model, batch, glossary, api_id, lookup=None):
                     {"role": "user", "content": user_content},
                 ],
 
-                temperature=0.1,
+                temperature=temperature,
             )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
@@ -507,8 +517,9 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
         cfg = ws["cfg"]
         _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 開始 ({len(batch)} 條) [{cfg.api_id} {cfg.model}]")
         try:
+            p2_temp = {1: P2_TEMPERATURE_R1, 2: P2_TEMPERATURE_R2}[rnd]
             results = await _evaluate_batch(ws["client"], cfg.model, batch, glossary,
-                                            cfg.api_id, lookup=lookup)
+                                            cfg.api_id, lookup=lookup, temperature=p2_temp)
             results = results[:len(batch)]
             # 正規化後的等級一律是非空字串（壞值→「严重」），計數與 skip_pairs 才一致
             normalized = []
@@ -608,13 +619,13 @@ SYSTEM_PROMPT_POLISH = (
     "2. 保持游戏术语一致\n"
     "3. 保留 HTML/XML 标签（如 <col...>, <br>, </col> 等）\n"
     "4. 保留占位符（如 []内的文字）\n"
-    "5. 流畅自然和避免翻译腔优先，不必完全忠实原文内容，但要記住OSRS是西方奇幻類遊戲，不應出現過於中式的字詞\n"
+    "5. 翻譯目標以流暢自然和避免翻譯腔為優先，不必完全忠實原文內容\n"
     "6. 每条翻译独立进行，不要合并或省略\n"
     "7. 输出格式为原始 JSON 阵列（不要使用 ```json 代码块包裹），每条物件包含 "
     "\"index\" 和 \"translation\" 两个栏位\n"
     "8. 如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式。"
     "你必須使用'.'分隔，不要自行改為'·'或其他方式。你必須使用'.'分隔，不要自行改為'·'或其他方式。\n"
-    "## 强制术语表（禁止使用官方和社区通常的翻譯，遇到以下英文词必须使用指定的中文翻译）\n"
+    "## 强制术语表（禁止使用官方和社区通常的翻译，遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译）\n"
     "{RELEVANT_GLOSSARY}"
 )
 
@@ -637,7 +648,7 @@ async def _polish_batch(client, model, batch, glossary, api_id, lookup=None):
                     {"role": "user", "content": user_content},
                 ],
 
-                temperature=0.1,
+                temperature=P3_TEMPERATURE,
             )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)

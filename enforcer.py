@@ -22,14 +22,25 @@ from api_config import (
 )
 from shared_pool import SharedBatchPool
 
+# 重譯（Phase C／P4a）取樣溫度。修正型任務仍以確定性為主，但保留一點彈性
+# 讓模型能換個寫法。任何結束迴圈的輪次都可能是實質最後一輪（問題 <3 條、
+# 修正率 <5% 都會提前結束），且 regressed 守門只擋「未翻譯／佔位符」兩類，
+# 因此升溫寫回的術語類新錯誤沒有兜底。
+RETRY_TEMPERATURE = 0.2
+
 RETRY_PROMPTS = [
-    "1. 禁止翻譯 [] 内的内容，如果译文中 [] 内的内容与原文不同，必須恢复为原文的占位符。"
-    "2. 如果当前译文与原文完全相同或沒有內容，请重新翻译。"
-    "3. 使用简体中文修正以下翻译中的游戏术语错误。"
-    "4. 如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
-    "术语仍不正确，或占位符被翻译，或译文与原文相同、沒有內容，请严格对照要求重新翻译。"
+    "1. 只能输出简体中文，除非是占位符、标签或代码。"
+    "2. 发送内容在以往翻译时出现游戏术语错误、占位符被翻译、输出原文或空白内容的问题，所以你要注意避免翻译 [] 内的内容、HTML/XML 标签（如 <col...>, <br>, </col> 等），和避免游戏术语错误。"
+    "3. 如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式："
+    "4. 翻译时要保持流畅自然和避免翻译腔，不必完全忠实原文内容。"
+    "5. 每条翻译独立进行，不要合并或省略。",
+    "只能输出简体中文，除非是占位符、标签或代码。"
+    "发送内容多次在以往翻译时出现游戏术语错误、占位符被翻译、输出原文或空白内容的问题，请你在翻译时避免以上问题，并保持流畅自然和避免翻译腔，不必完全忠实原文内容。"
+    "每条翻译独立进行，不要合并或省略。"
     "如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
-    "最后一次修正，以下条目的术语必须使用指定翻译，占位符必须保留原样，且不能回吐原文。"
+    "只能输出简体中文，除非是占位符、标签或代码。"
+    "发送内容多次在以往翻译时出现游戏术语错误、占位符被翻译、输出原文或空白内容的问题，请你在翻译时避免以上问题，并保持流畅自然和避免翻译腔，不必完全忠实原文内容。"
+    "每条翻译独立进行，不要合并或省略。"
     "如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
 ]
 
@@ -453,7 +464,7 @@ async def _retry_round(client, model_name, pool, glossary, rnd, lookup=None):
         items = [{"index": idx, "english": str(row["english"])} for idx, row, _ in batch]
         glossary_text = build_retry_glossary_text(glossary, items, lookup)
         prompt = (RETRY_PROMPTS[rnd] + "\n" + json.dumps(items, ensure_ascii=False)
-                  + f"\n## 强制术语表（请严格使用以下翻译）\n{glossary_text}"
+                  + f"\n## 强制术语表（禁止使用官方和社区通常的翻译，遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译）\n{glossary_text}"
                   + "\n请回传 JSON 阵列，每条包含 index 和 translation。")
         content = ""
         for attempt in range(3):
@@ -461,7 +472,7 @@ async def _retry_round(client, model_name, pool, glossary, rnd, lookup=None):
                 resp = await client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
+                    temperature=RETRY_TEMPERATURE,
                 )
                 # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
                 content = resp.choices[0].message.content.strip()

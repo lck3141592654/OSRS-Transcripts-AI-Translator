@@ -11,12 +11,12 @@
 An AI-powered automated pipeline designed for large-scale game text translation. Scripts can be placed anywhere — no specific project structure required.
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update v0.4.7 (1/11/2026), see [Changelog](Changelog.md) for details
-- **Translation correctness**: retranslation / polish writes now pass a regression gate, so a model echoing the English source can no longer overwrite valid Chinese; glossary entries whose translation equals the source (player names, etc.) are no longer treated as untranslated; rows with a missing source are no longer sent back for retranslation
-- **Safe resume**: proofreading uses its own `_proofread_checkpoint`, so an interrupted main translation no longer loses its progress; resume now compares a source fingerprint and asks "discard and retranslate / cancel" if the workbook changed
-- **Custom HTTP headers**: new optional `APIx_EXTRA_HEADERS` (JSON or `Name: Value; ...` shorthand) for providers such as **OpenCode Go** that require `x-opencode-session` and a custom User-Agent; when unset, requests are identical to the previous release
-- **Misc**: Ctrl+C now prints one line and exits with code 130; the legacy single API format supports `PARALLEL_LIMIT`
-- Highlights from v0.4.6 (much faster term scanning, main API default concurrency 100, per-phase timeouts, ...) still apply; see the Changelog
+## Latest Update v0.4.8 (6/11/2026), see [Changelog](Changelog.md) for details
+- **Per-phase sampling temperatures**: main translation 0.3, retranslation 0.2, P2 dual-round evaluation 0.1 / 0.3, P3 polish 0.3; each constant documents its scope
+- **Unified glossary wording**: main translation, P2 evaluation, P3 polish and retranslation now share "遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译", adding a context-conflict escape so proper nouns used as ordinary words (Drain, Spawn) are no longer forced into sentences
+- **Retranslation prompt rewritten**: round 1 is now five rules and rounds 2/3 share one text; the fluency rule in main translation and P3 is rewritten and the P2 role line becomes "简体中文翻译品质评估专家"
+- **Cleanup**: the `v1.5` label is removed from the startup banner; the comment referencing the non-existent `tests/test_fingerprint.py` is removed
+- Highlights from v0.4.7 (regression gate, checkpoint isolation, source fingerprint, custom HTTP headers, ...) still apply; see the Changelog
 
 ### Features
 

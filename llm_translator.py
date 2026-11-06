@@ -14,6 +14,13 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 BATCH_SIZE_LIMIT = 100
 
+# 主翻譯（Phase B）取樣溫度。單次 A/B 實測（534 條含數字條目，各跑一次、未重複）：
+# 0.1 與 0.3 的數字漏失同為 2 例，且都是跨行截斷（屬格式問題，不能據此判定溫度影響）；
+# 0.3 的主要差異是措辭變動率約 67%（同輸入重跑較不一致）、長度比相近；
+# 佔位符違規略增，靠 Phase C 重譯與 regressed 守門緩解。
+# 以上僅單次觀察，不足以證明 0.1／0.3 在數字保真上等價。
+TRANSLATE_TEMPERATURE = 0.3
+
 def _is_na(value) -> bool:
     """判斷「值本身是不是 NA 純量」：None／pd.NA／NaN／NaT。
 
@@ -96,14 +103,14 @@ SYSTEM_PROMPT_BASE = (
     "2. 保持游戏术语一致\n"
     "3. 保留 HTML/XML 标签（如 <col...>, <br>, </col> 等）\n"
     "4. 保留占位符（如 []內的文字）\n"
-    "5. 流暢自然和避免翻譯腔優先，不必完全忠實原文內容\n"
+    "5. 翻譯目標以流暢自然和避免翻譯腔為優先，不必完全忠實原文內容\n"
     "6. 每条翻译独立进行，不要合并或省略\n"
     "7. 如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式。"
     "你必須使用'.'分隔，不要自行改為'·'或其他方式。你必須使用'.'分隔，不要自行改為'·'或其他方式。\n"
     "8. 输出格式为原始 JSON 阵列（不要使用 ```json 代码块包裹），每条物件包含 "
     "\"index\" 和 \"translation\" 两个栏位\n"
     "9. 只输出 index 和 translation 两个栏位，不要回传 notes、wiki_url 或其他栏位\n\n"
-    "## 强制术语表（禁止使用官方和社区通常的翻譯，遇到以下英文词必须使用指定的中文翻译）\n"
+    "## 强制术语表（禁止使用官方和社区通常的翻译，遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译）\n"
     "{RELEVANT_GLOSSARY}"
 )
 
@@ -450,7 +457,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?", look
                     {"role": "user", "content": user_content},
                 ],
 
-                temperature=0.1,
+                temperature=TRANSLATE_TEMPERATURE,
             )
             # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
             text = resp.choices[0].message.content.strip()

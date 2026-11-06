@@ -1,5 +1,19 @@
 # Changelog
 
+## 6/11/2026 v0.4.7 -> v0.4.8
+
+### 中文
+- **取樣溫度分階段設定**：主翻譯（Phase B）0.1 → 0.3（`TRANSLATE_TEMPERATURE`）、重譯（Phase C／P4a）0 → 0.2（`RETRY_TEMPERATURE`）、P2 雙輪評估 0.1 → 第一輪 0.1／第二輪 0.3（`P2_TEMPERATURE_R1`／`P2_TEMPERATURE_R2`，`_evaluate_batch()` 新增 `temperature` 參數）、P3 潤色 0.1 → 0.3（`P3_TEMPERATURE`）；四個常數都附上適用範圍的註解
+- **術語表措辭統一**：主翻譯、P2 評估、P3 潤色、重譯四處統一為「禁止使用官方和社区通常的翻译，遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译」，新增語境衝突豁免，「必須」放寬為「盡量」
+- **提示詞調整**：重譯第 1 輪改為 5 條規則、第 2／3 輪統一並移除原本第 3 輪的強制措辭；主翻譯與 P3 的流暢度規則改寫，P3 移除「不應出現過於中式的字詞」；P2 角色改為「简体中文翻译品质评估专家」
+- **清理**：啟動橫幅移除 `v1.5`；移除引用不存在檔案的 `tests/test_fingerprint.py` 註解
+
+### English
+- **Per-phase sampling temperatures**: main translation (Phase B) 0.1 -> 0.3 (`TRANSLATE_TEMPERATURE`), retranslation (Phase C / P4a) 0 -> 0.2 (`RETRY_TEMPERATURE`), P2 dual-round evaluation 0.1 -> round 1 at 0.1 / round 2 at 0.3 (`P2_TEMPERATURE_R1` / `P2_TEMPERATURE_R2`, with `_evaluate_batch()` gaining a `temperature` parameter), P3 polish 0.1 -> 0.3 (`P3_TEMPERATURE`); each constant documents its scope
+- **Unified glossary wording**: the four prompts (main translation, P2 evaluation, P3 polish, retranslation) now share "禁止使用官方和社区通常的翻译，遇到以下英文词除非有语境冲突，否则尽量使用指定的中文翻译", adding a context-conflict escape and relaxing "必須" to "盡量"
+- **Prompt adjustments**: retranslation round 1 now has five rules and rounds 2/3 share one text without round 3's old enforcement wording; the fluency rule in main translation and P3 is rewritten and P3 drops "不應出現過於中式的字詞"; the P2 role line becomes "简体中文翻译品质评估专家"
+- **Cleanup**: the `v1.5` label is removed from the startup banner; the comment referencing the non-existent `tests/test_fingerprint.py` is removed
+
 ## 1/11/2026 v0.4.6 -> v0.4.7
 
 ### 中文
